@@ -25,10 +25,6 @@ output_dir=$(CDPATH= cd -- "$output_dir" && pwd)
 
 patch_driver="$output_dir/1001-Add-t2bce-driver-stack.patch"
 patch_integration="$output_dir/1002-Integrate-t2bce-driver-stack.patch"
-if [ -e "$patch_driver" ] || [ -e "$patch_integration" ]; then
-	echo "Refusing to overwrite existing T2BCE patches in $output_dir" >&2
-	exit 1
-fi
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
