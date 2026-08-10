@@ -650,10 +650,10 @@ static void bce_vhci_transfer_queue_cancel_w(struct work_struct *work)
         urb->hcpriv = NULL;
         spin_unlock_irqrestore(&q->urb_lock, flags);
 
-        usb_hcd_giveback_urb(q->vhci->hcd, urb, status);
-
         if (was_active)
             bce_vhci_transfer_queue_resume(q, BCE_VHCI_PAUSE_INTERNAL_WQ);
+
+        usb_hcd_giveback_urb(q->vhci->hcd, urb, status);
 
         bce_vhci_urb_free(vurb);
     }
