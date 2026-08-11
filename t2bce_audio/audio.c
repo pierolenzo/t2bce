@@ -1,4 +1,5 @@
 #include <linux/pci.h>
+#include <linux/string.h>
 #include <linux/spinlock.h>
 #include <linux/module.h>
 #include <linux/random.h>
@@ -559,7 +560,7 @@ static struct t2audio_subdevice *t2audio_find_dev_by_uid(struct t2audio_device *
 {
     struct t2audio_subdevice *sdev;
     list_for_each_entry(sdev, &a->subdevice_list, list) {
-        if (!strcmp(uid, sdev->uid))
+        if (strstarts(uid, sdev->uid))
             return sdev;
     }
     return NULL;
@@ -604,6 +605,7 @@ static int t2audio_init_bs(struct t2audio_device *a)
             dev_err(a->dev, "t2bce_audio: Subdevice not found for BufferStruct device %s\n", dev->name);
             continue;
         }
+        strscpy(dev->name, sdev->uid, sizeof(dev->name));
         sdev->buf_id = (u8) i;
         dev->num_input_streams = 0;
         for (j = 0; j < dev->num_output_streams; j++) {
@@ -619,7 +621,7 @@ static int t2audio_init_bs(struct t2audio_device *a)
             continue;
         sdev->buf_id = i;
         pr_debug("t2bce_audio: Created device %i %s\n", i, sdev->uid);
-        strcpy(a->bs->devices[i].name, sdev->uid);
+        strscpy(a->bs->devices[i].name, sdev->uid, sizeof(a->bs->devices[i].name));
         a->bs->devices[i].num_input_streams = 0;
         a->bs->devices[i].num_output_streams = 0;
         a->bs->num_devices = ++i;
