@@ -100,6 +100,13 @@ int bce_vhci_create(struct device *parent, struct bce_vhci *vhci)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0)
     vhci->hcd->self.uses_dma = 1;
 #endif
+    /*
+     * The HCD accepts arbitrary Linux scatterlists and splits them into the
+     * 32-element descriptor blocks supported by bridgeOS.  Segment boundaries
+     * do not have to match USB max-packet boundaries.
+     */
+    vhci->hcd->self.sg_tablesize = ~0U;
+    vhci->hcd->self.no_sg_constraint = 1;
     *((struct bce_vhci **) vhci->hcd->hcd_priv) = vhci;
     vhci->hcd->speed = HCD_USB2;
 
@@ -860,7 +867,7 @@ static int bce_vhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_
         return -ENOENT;
     pr_debug("t2bce_vhci: urb_enqueue dev=%u ep=%02x\n",
             q->dev_addr, urb->ep->desc.bEndpointAddress);
-    return bce_vhci_urb_create(q, urb);
+    return bce_vhci_urb_create(q, urb, mem_flags);
 }
 
 static int bce_vhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)

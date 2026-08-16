@@ -1,7 +1,6 @@
 #include "transfer.h"
 #include "vhci.h"
-#include <linux/dma-mapping.h>
-#include <linux/scatterlist.h>
+#include <linux/err.h>
 #include <linux/usb/hcd.h>
 
 static void bce_vhci_transfer_queue_completion(struct t2bce_core_queue_sq *sq);
@@ -187,11 +186,12 @@ static void bce_vhci_urb_log_control(struct bce_vhci_urb *urb, const char *stage
 
     ctrl = (struct usb_ctrlrequest *) urb->urb->setup_packet;
     if (!ctrl) {
-        pr_debug("t2bce_vhci: EP0 control %s dev=%u port=%d urb_state=%u no-setup xfer_len=%u actual=%u send=%u recv=%u status=%d active=%u paused_by=%x stalled=%u qstate=%u remaining=%u urb_reject=%d\n",
+        pr_debug("t2bce_vhci: EP0 control %s dev=%u port=%d urb_state=%u no-setup xfer_len=%u actual=%u recv=%u request_end=%u submitted=%u status=%d active=%u paused_by=%x stalled=%u qstate=%u remaining=%u urb_reject=%d\n",
                 stage, q->dev_addr, bce_vhci_transfer_queue_port(q),
                 urb->state, urb->urb->transfer_buffer_length,
-                urb->urb->actual_length, urb->send_offset,
-                urb->receive_offset, urb->received_status, q->active,
+                urb->urb->actual_length, urb->receive_offset,
+                urb->request_end, urb->submitted_length,
+                urb->received_status, q->active,
                 q->paused_by, q->stalled, q->state,
                 q->remaining_active_requests, atomic_read(&urb->urb->reject));
         return;
@@ -201,14 +201,15 @@ static void bce_vhci_urb_log_control(struct bce_vhci_urb *urb, const char *stage
      * Keep this at pr_debug; enable dynamic debug when diagnosing
      * setup/data/status ordering or endpoint recovery issues.
      */
-    pr_debug("t2bce_vhci: EP0 control %s dev=%u port=%d urb_state=%u dir=%s reqtype=%02x req=%02x value=%04x index=%04x wlen=%u xfer_len=%u actual=%u send=%u recv=%u status=%d active=%u paused_by=%x stalled=%u qstate=%u remaining=%u urb_reject=%d\n",
+    pr_debug("t2bce_vhci: EP0 control %s dev=%u port=%d urb_state=%u dir=%s reqtype=%02x req=%02x value=%04x index=%04x wlen=%u xfer_len=%u actual=%u recv=%u request_end=%u submitted=%u status=%d active=%u paused_by=%x stalled=%u qstate=%u remaining=%u urb_reject=%d\n",
             stage, q->dev_addr, bce_vhci_transfer_queue_port(q),
             urb->state, usb_urb_dir_in(urb->urb) ? "in" : "out",
             ctrl->bRequestType, ctrl->bRequest,
             le16_to_cpu(ctrl->wValue), le16_to_cpu(ctrl->wIndex),
             le16_to_cpu(ctrl->wLength), urb->urb->transfer_buffer_length,
-            urb->urb->actual_length, urb->send_offset, urb->receive_offset,
-            urb->received_status, q->active, q->paused_by, q->stalled,
+            urb->urb->actual_length, urb->receive_offset,
+            urb->request_end, urb->submitted_length, urb->received_status,
+            q->active, q->paused_by, q->stalled,
             q->state, q->remaining_active_requests,
             atomic_read(&urb->urb->reject));
 }
@@ -683,130 +684,46 @@ static int bce_vhci_urb_data_start(struct bce_vhci_urb *urb, unsigned long *time
 
 static bool bce_vhci_urb_uses_sg(struct bce_vhci_urb *urb)
 {
-    return urb->sg_segments && urb->urb->sg && urb->urb->num_mapped_sgs > 0;
+    return urb->sg_list != NULL;
 }
 
-static void bce_vhci_urb_sync_sg_segments_for_cpu(struct bce_vhci_urb *urb)
+static bool bce_vhci_urb_is_zlp(struct bce_vhci_urb *urb)
 {
-    struct device *dev;
-
-    if (!urb->sg_segments_for_device)
-        return;
-
-    dev = t2bce_core_client_dma_dev(urb->q->vhci->client);
-    dma_sync_single_for_cpu(dev, urb->sg_segments_dma, urb->sg_segments_size,
-            DMA_TO_DEVICE);
-    urb->sg_segments_for_device = false;
+    return urb->dir == DMA_TO_DEVICE &&
+            usb_endpoint_xfer_bulk(&urb->urb->ep->desc) &&
+            !urb->urb->transfer_buffer_length;
 }
 
 static void bce_vhci_urb_free(struct bce_vhci_urb *urb)
 {
-    struct device *dev;
-
     if (!urb)
         return;
 
-    if (urb->sg_segments) {
-        bce_vhci_urb_sync_sg_segments_for_cpu(urb);
-        dev = t2bce_core_client_dma_dev(urb->q->vhci->client);
-        dma_unmap_single(dev, urb->sg_segments_dma, urb->sg_segments_size,
-                DMA_TO_DEVICE);
-        kfree(urb->sg_segments);
-    }
+    t2bce_core_destroy_segment_list(urb->q->vhci->client, urb->sg_list);
 
     kfree(urb);
 }
 
-static int bce_vhci_urb_init_sg_segments(struct bce_vhci_urb *vurb)
+static int bce_vhci_urb_init_sg_segments(struct bce_vhci_urb *vurb,
+        gfp_t mem_flags)
 {
-    struct device *dev;
-
     if (!vurb->urb->sg || vurb->urb->num_mapped_sgs <= 0)
         return 0;
 
-    if (vurb->urb->num_mapped_sgs > SIZE_MAX / sizeof(*vurb->sg_segments))
-        return -EOVERFLOW;
+    vurb->sg_list = t2bce_core_create_segment_list(vurb->q->vhci->client,
+            vurb->urb->sg, vurb->urb->num_mapped_sgs, mem_flags);
+    if (IS_ERR(vurb->sg_list)) {
+        int status = PTR_ERR(vurb->sg_list);
 
-    vurb->sg_segment_count = vurb->urb->num_mapped_sgs;
-    vurb->sg_segments_size = vurb->sg_segment_count * sizeof(*vurb->sg_segments);
-    vurb->sg_segments = kcalloc(vurb->sg_segment_count,
-            sizeof(*vurb->sg_segments), GFP_KERNEL);
-    if (!vurb->sg_segments)
-        return -ENOMEM;
-
-    dev = t2bce_core_client_dma_dev(vurb->q->vhci->client);
-    vurb->sg_segments_dma = dma_map_single(dev, vurb->sg_segments,
-            vurb->sg_segments_size, DMA_TO_DEVICE);
-    if (dma_mapping_error(dev, vurb->sg_segments_dma)) {
-        kfree(vurb->sg_segments);
-        vurb->sg_segments = NULL;
-        vurb->sg_segments_size = 0;
-        vurb->sg_segment_count = 0;
-        return -ENOMEM;
+        vurb->sg_list = NULL;
+        return status;
     }
-    vurb->sg_segments_for_device = true;
-    bce_vhci_urb_sync_sg_segments_for_cpu(vurb);
 
     return 0;
 }
 
-static int bce_vhci_urb_set_sg_submission(struct bce_vhci_urb *urb,
-        struct t2bce_core_queue_sq *sq, u32 offset, u32 size)
-{
-    struct device *dev = t2bce_core_client_dma_dev(urb->q->vhci->client);
-    struct scatterlist *sg;
-    unsigned int i;
-    unsigned int segment_count = 0;
-    u32 skip = offset;
-    u32 remaining = size;
-
-    if (!bce_vhci_urb_uses_sg(urb) || !size)
-        return -EINVAL;
-
-    /*
-     * BCE consumes a compact address/length array, not Linux scatterlist
-     * metadata.  Rebuild that array for the requested URB window.
-     */
-    bce_vhci_urb_sync_sg_segments_for_cpu(urb);
-
-    for_each_sg(urb->urb->sg, sg, urb->urb->num_mapped_sgs, i) {
-        dma_addr_t addr = sg_dma_address(sg);
-        u32 sg_len = sg_dma_len(sg);
-        u32 segment_len;
-
-        if (!sg_len)
-            continue;
-        if (skip >= sg_len) {
-            skip -= sg_len;
-            continue;
-        }
-
-        addr += skip;
-        sg_len -= skip;
-        skip = 0;
-
-        segment_len = min(sg_len, remaining);
-        urb->sg_segments[segment_count].addr = addr;
-        urb->sg_segments[segment_count].length = segment_len;
-        segment_count++;
-        remaining -= segment_len;
-
-        if (!remaining)
-            break;
-    }
-
-    if (remaining || !segment_count)
-        return -EINVAL;
-
-    dma_sync_single_for_device(dev, urb->sg_segments_dma,
-            segment_count * sizeof(*urb->sg_segments), DMA_TO_DEVICE);
-    urb->sg_segments_for_device = true;
-    t2bce_core_set_next_submission_segment_list(sq, urb->sg_segments_dma,
-            segment_count * sizeof(*urb->sg_segments));
-    return 0;
-}
-
-int bce_vhci_urb_create(struct bce_vhci_transfer_queue *q, struct urb *urb)
+int bce_vhci_urb_create(struct bce_vhci_transfer_queue *q, struct urb *urb,
+        gfp_t mem_flags)
 {
     unsigned long flags;
     int status = 0;
@@ -822,7 +739,7 @@ int bce_vhci_urb_create(struct bce_vhci_transfer_queue *q, struct urb *urb)
         queue_work(q->vhci->tq_state_wq, &q->w_resume);
     }
 
-    vurb = kzalloc(sizeof(struct bce_vhci_urb), GFP_KERNEL);
+    vurb = kzalloc(sizeof(struct bce_vhci_urb), mem_flags);
     if (!vurb)
         return -ENOMEM;
 
@@ -833,7 +750,7 @@ int bce_vhci_urb_create(struct bce_vhci_transfer_queue *q, struct urb *urb)
     vurb->dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
     vurb->is_control = is_control;
     INIT_LIST_HEAD(&vurb->cancel_list);
-    status = bce_vhci_urb_init_sg_segments(vurb);
+    status = bce_vhci_urb_init_sg_segments(vurb, mem_flags);
     if (status) {
         urb->hcpriv = NULL;
         bce_vhci_urb_free(vurb);
@@ -923,6 +840,20 @@ static void bce_vhci_urb_complete(struct bce_vhci_urb *urb, int status)
     list_add_tail(&real_urb->urb_list, &q->giveback_urb_list);
 }
 
+static int bce_vhci_urb_fail_data_transfer(struct bce_vhci_urb *urb,
+        int status)
+{
+    struct bce_vhci_transfer_queue *q = urb->q;
+
+    /* Stop new URBs until endpoint reset has discarded the open data window. */
+    q->active = false;
+    q->stalled = true;
+    urb->urb->actual_length = urb->receive_offset;
+    bce_vhci_urb_complete(urb, status);
+    bce_vhci_transfer_queue_request_reset(q);
+    return -ENOENT;
+}
+
 int bce_vhci_urb_request_cancel(struct bce_vhci_transfer_queue *q, struct urb *urb, int status)
 {
     struct bce_vhci_urb *vurb;
@@ -963,12 +894,53 @@ int bce_vhci_urb_request_cancel(struct bce_vhci_transfer_queue *q, struct urb *u
     return 0;
 }
 
-static int bce_vhci_urb_data_transfer_in(struct bce_vhci_urb *urb, unsigned long *timeout)
+static int bce_vhci_urb_prepare_in_submission(struct bce_vhci_urb *urb,
+        u32 requested_size)
+{
+    size_t submitted_size = requested_size;
+    u32 offset = urb->receive_offset;
+    int status;
+
+    if (bce_vhci_urb_uses_sg(urb) && requested_size) {
+        status = t2bce_core_set_next_submission_segment_list(urb->q->sq_in,
+                urb->sg_list, offset, requested_size, &submitted_size);
+        if (status)
+            return status;
+    } else {
+        t2bce_core_set_next_submission_single(urb->q->sq_in,
+                urb->urb->transfer_dma + offset, requested_size);
+    }
+
+    urb->submitted_length = submitted_size;
+    return 0;
+}
+
+static int bce_vhci_urb_continue_in(struct bce_vhci_urb *urb)
+{
+    unsigned long timeout = 0;
+    int status;
+
+    if (t2bce_core_reserve_submission(urb->q->sq_in, &timeout))
+        return -EPIPE;
+
+    status = bce_vhci_urb_prepare_in_submission(urb,
+            urb->request_end - urb->receive_offset);
+    if (status) {
+        t2bce_core_cancel_submission_reservation(urb->q->sq_in);
+        return status;
+    }
+
+    t2bce_core_submit_to_device(urb->q->sq_in);
+    urb->state = BCE_VHCI_URB_WAITING_FOR_COMPLETION;
+    return 0;
+}
+
+static int bce_vhci_urb_data_transfer_in(struct bce_vhci_urb *urb,
+        unsigned long *timeout)
 {
     struct bce_vhci_message msg;
-    u32 tr_len;
+    u32 request_length;
     int reservation1, reservation2 = -EFAULT;
-    bool uses_sg;
     int status;
 
     pr_debug("t2bce_vhci: [%02x] DMA from device %llx %x\n", urb->q->endp_addr,
@@ -985,34 +957,26 @@ static int bce_vhci_urb_data_transfer_in(struct bce_vhci_urb *urb, unsigned long
         return -ENOMEM;
     }
 
-    urb->send_offset = urb->receive_offset;
-
-    tr_len = urb->urb->transfer_buffer_length - urb->send_offset;
-    uses_sg = bce_vhci_urb_uses_sg(urb);
-
-    if (uses_sg) {
-        status = bce_vhci_urb_set_sg_submission(urb, urb->q->sq_in,
-                urb->send_offset, tr_len);
-        if (status) {
-            t2bce_core_cancel_submission_reservation(urb->q->sq_in);
-            t2bce_core_cancel_submission_reservation(urb->q->vhci->msg_asynchronous.sq);
-            pr_err("t2bce_vhci: [%02x] failed to prepare SG IN submission: %d\n",
-                    urb->q->endp_addr, status);
-            return status;
-        }
+    request_length = urb->urb->transfer_buffer_length - urb->receive_offset;
+    urb->request_end = urb->receive_offset + request_length;
+    status = bce_vhci_urb_prepare_in_submission(urb, request_length);
+    if (status) {
+        t2bce_core_cancel_submission_reservation(urb->q->sq_in);
+        t2bce_core_cancel_submission_reservation(
+                urb->q->vhci->msg_asynchronous.sq);
+        pr_err("t2bce_vhci: [%02x] failed to prepare SG IN submission: %d\n",
+                urb->q->endp_addr, status);
+        return status;
     }
 
     spin_lock(&urb->q->vhci->msg_asynchronous_lock);
     msg.cmd = BCE_VHCI_CMD_TRANSFER_REQUEST;
     msg.status = 0;
     msg.param1 = ((urb->urb->ep->desc.bEndpointAddress & 0x8Fu) << 8) | urb->q->dev_addr;
-    msg.param2 = tr_len;
+    msg.param2 = request_length;
     bce_vhci_message_queue_write(&urb->q->vhci->msg_asynchronous, &msg);
     spin_unlock(&urb->q->vhci->msg_asynchronous_lock);
 
-    if (!uses_sg)
-        t2bce_core_set_next_submission_single(urb->q->sq_in,
-                urb->urb->transfer_dma + urb->send_offset, tr_len);
     t2bce_core_submit_to_device(urb->q->sq_in);
 
     urb->state = BCE_VHCI_URB_WAITING_FOR_COMPLETION;
@@ -1022,7 +986,8 @@ static int bce_vhci_urb_data_transfer_in(struct bce_vhci_urb *urb, unsigned long
 static int bce_vhci_urb_data_start(struct bce_vhci_urb *urb, unsigned long *timeout)
 {
     if (urb->dir == DMA_TO_DEVICE) {
-        if (urb->urb->transfer_buffer_length > 0)
+        if (urb->urb->transfer_buffer_length > 0 ||
+            bce_vhci_urb_is_zlp(urb))
             urb->state = BCE_VHCI_URB_WAITING_FOR_TRANSFER_REQUEST;
         else
             urb->state = BCE_VHCI_URB_DATA_TRANSFER_COMPLETE;
@@ -1051,9 +1016,10 @@ static int bce_vhci_urb_send_out_data(struct bce_vhci_urb *urb, dma_addr_t addr,
 }
 
 static int bce_vhci_urb_send_out_transfer_data(struct bce_vhci_urb *urb,
-        u32 offset, size_t size)
+        u32 offset, u32 *size)
 {
     unsigned long timeout = 0;
+    size_t submitted_size;
     int status;
 
     if (t2bce_core_reserve_submission(urb->q->sq_out, &timeout)) {
@@ -1061,18 +1027,21 @@ static int bce_vhci_urb_send_out_transfer_data(struct bce_vhci_urb *urb,
         return -EPIPE;
     }
 
-    if (bce_vhci_urb_uses_sg(urb)) {
-        status = bce_vhci_urb_set_sg_submission(urb, urb->q->sq_out,
-                offset, size);
+    if (!*size) {
+        t2bce_core_set_next_submission_single(urb->q->sq_out, 0, 0);
+    } else if (bce_vhci_urb_uses_sg(urb)) {
+        status = t2bce_core_set_next_submission_segment_list(urb->q->sq_out,
+                urb->sg_list, offset, *size, &submitted_size);
         if (status) {
             t2bce_core_cancel_submission_reservation(urb->q->sq_out);
             pr_err("t2bce_vhci: [%02x] failed to prepare SG OUT submission: %d\n",
                     urb->q->endp_addr, status);
             return status;
         }
+        *size = submitted_size;
     } else {
         t2bce_core_set_next_submission_single(urb->q->sq_out,
-                urb->urb->transfer_dma + offset, size);
+                urb->urb->transfer_dma + offset, *size);
     }
 
     atomic_inc(&urb->q->sq_out_pending);
@@ -1080,18 +1049,52 @@ static int bce_vhci_urb_send_out_transfer_data(struct bce_vhci_urb *urb,
     return 0;
 }
 
-static int bce_vhci_urb_data_update(struct bce_vhci_urb *urb, struct bce_vhci_message *msg)
+static int bce_vhci_urb_continue_out(struct bce_vhci_urb *urb)
 {
     u32 tr_len;
     int status;
+
+    if (urb->receive_offset < urb->request_end) {
+        tr_len = urb->request_end - urb->receive_offset;
+    } else if (bce_vhci_urb_is_zlp(urb)) {
+        tr_len = 0;
+    } else {
+        return -EINVAL;
+    }
+
+    status = bce_vhci_urb_send_out_transfer_data(urb,
+            urb->receive_offset, &tr_len);
+    if (status)
+        return status;
+
+    urb->submitted_length = tr_len;
+    urb->state = BCE_VHCI_URB_WAITING_FOR_COMPLETION;
+    return 0;
+}
+
+static int bce_vhci_urb_data_update(struct bce_vhci_urb *urb, struct bce_vhci_message *msg)
+{
+    int status;
     if (urb->state == BCE_VHCI_URB_WAITING_FOR_TRANSFER_REQUEST) {
         if (msg->cmd == BCE_VHCI_CMD_TRANSFER_REQUEST) {
-            tr_len = min(urb->urb->transfer_buffer_length - urb->send_offset, (u32) msg->param2);
+            u32 remaining = urb->urb->transfer_buffer_length -
+                    urb->receive_offset;
+            u32 request_length = min_t(u64, remaining, msg->param2);
+
+            if (!remaining && !bce_vhci_urb_is_zlp(urb))
+                return -EAGAIN;
+
+            if (remaining && !request_length) {
+                pr_err("t2bce_vhci: [%02x] device requested an empty OUT window with %u bytes remaining\n",
+                        urb->q->endp_addr, remaining);
+                return bce_vhci_urb_fail_data_transfer(urb, -EPROTO);
+            }
+
+            urb->request_end = urb->receive_offset + request_length;
             bce_vhci_urb_log_control(urb, "data-request");
-            if ((status = bce_vhci_urb_send_out_transfer_data(urb, urb->send_offset, tr_len)))
-                return status;
-            urb->send_offset += tr_len;
-            urb->state = BCE_VHCI_URB_WAITING_FOR_COMPLETION;
+            status = bce_vhci_urb_continue_out(urb);
+            if (status)
+                return bce_vhci_urb_fail_data_transfer(urb, status);
             bce_vhci_urb_log_control(urb, "data-sent");
             return 0;
         }
@@ -1108,11 +1111,70 @@ static int bce_vhci_urb_data_update(struct bce_vhci_urb *urb, struct bce_vhci_me
 
 static int bce_vhci_urb_data_transfer_completion(struct bce_vhci_urb *urb, struct t2bce_core_sq_completion_data *c)
 {
-    bce_vhci_urb_sync_sg_segments_for_cpu(urb);
-
     if (urb->state == BCE_VHCI_URB_WAITING_FOR_COMPLETION) {
+        int status;
+
+        if (urb->receive_offset > urb->urb->transfer_buffer_length ||
+            c->data_size > urb->submitted_length ||
+            c->data_size > urb->urb->transfer_buffer_length -
+                    urb->receive_offset) {
+            pr_err("t2bce_vhci: [%02x] completion overrun (offset=%u size=%llu submitted=%u total=%u)\n",
+                    urb->q->endp_addr, urb->receive_offset,
+                    c->data_size, urb->submitted_length,
+                    urb->urb->transfer_buffer_length);
+            return bce_vhci_urb_fail_data_transfer(urb, -EOVERFLOW);
+        }
+
         urb->receive_offset += c->data_size;
-        if (urb->dir == DMA_FROM_DEVICE || urb->receive_offset >= urb->urb->transfer_buffer_length) {
+        if (c->status != T2BCE_COMPLETION_SUCCESS) {
+            pr_err("t2bce_vhci: [%02x] data submission failed (status=%u, transferred=%llu)\n",
+                    urb->q->endp_addr, c->status, c->data_size);
+            return bce_vhci_urb_fail_data_transfer(urb, -EIO);
+        }
+
+        if (urb->dir == DMA_TO_DEVICE &&
+            c->data_size != urb->submitted_length) {
+            pr_err("t2bce_vhci: [%02x] short OUT completion (%llu != %u)\n",
+                    urb->q->endp_addr, c->data_size,
+                    urb->submitted_length);
+            return bce_vhci_urb_fail_data_transfer(urb, -EREMOTEIO);
+        }
+
+        if (urb->dir == DMA_FROM_DEVICE &&
+            c->data_size < urb->submitted_length) {
+            urb->urb->actual_length = urb->receive_offset;
+            if (urb->urb->transfer_flags & URB_SHORT_NOT_OK) {
+                bce_vhci_urb_complete(urb, -EREMOTEIO);
+                return -ENOENT;
+            }
+
+            urb->state = BCE_VHCI_URB_DATA_TRANSFER_COMPLETE;
+            bce_vhci_urb_log_control(urb, "data-short-in");
+            if (!urb->is_control) {
+                bce_vhci_urb_complete(urb, 0);
+                return -ENOENT;
+            }
+            return 0;
+        }
+
+        if (urb->dir == DMA_FROM_DEVICE &&
+            urb->receive_offset < urb->request_end) {
+            status = bce_vhci_urb_continue_in(urb);
+            if (status)
+                return bce_vhci_urb_fail_data_transfer(urb, status);
+            bce_vhci_urb_log_control(urb, "data-continue-in");
+        } else if (urb->dir == DMA_TO_DEVICE &&
+                   urb->receive_offset < urb->request_end) {
+            status = bce_vhci_urb_continue_out(urb);
+            if (status)
+                return bce_vhci_urb_fail_data_transfer(urb, status);
+            bce_vhci_urb_log_control(urb, "data-continue-out");
+        } else if (urb->dir == DMA_TO_DEVICE &&
+                   urb->receive_offset < urb->urb->transfer_buffer_length) {
+            urb->state = BCE_VHCI_URB_WAITING_FOR_TRANSFER_REQUEST;
+            bce_vhci_urb_log_control(urb, "data-wait-request");
+        } else if (urb->dir == DMA_FROM_DEVICE ||
+                   urb->receive_offset >= urb->urb->transfer_buffer_length) {
             urb->urb->actual_length = (u32) urb->receive_offset;
             urb->state = BCE_VHCI_URB_DATA_TRANSFER_COMPLETE;
             bce_vhci_urb_log_control(urb, "data-complete");
@@ -1253,8 +1315,17 @@ static int bce_vhci_urb_transfer_completion(struct bce_vhci_urb *urb, struct t2b
 static void bce_vhci_urb_resume(struct bce_vhci_urb *urb)
 {
     int status = 0;
-    if (urb->state == BCE_VHCI_URB_WAITING_FOR_COMPLETION) {
+
+    if (urb->state != BCE_VHCI_URB_WAITING_FOR_COMPLETION)
+        return;
+
+    if (urb->dir == DMA_FROM_DEVICE) {
         status = bce_vhci_urb_data_transfer_in(urb, NULL);
+    } else {
+        /* The paused OUT submission was flushed; wait for a fresh window. */
+        urb->request_end = urb->receive_offset;
+        urb->submitted_length = 0;
+        urb->state = BCE_VHCI_URB_WAITING_FOR_TRANSFER_REQUEST;
     }
     if (status)
         bce_vhci_urb_complete(urb, status);

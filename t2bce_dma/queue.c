@@ -1,7 +1,11 @@
 #include "t2bce_dma_queue.h"
+#include <linux/dmapool.h>
 #include <linux/export.h>
+#include <linux/err.h>
 #include <linux/init.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/version.h>
@@ -16,6 +20,40 @@ struct bce_qe_submission {
     u64 segl_length;
 };
 
+/* Segment-list submissions select a byte range from header-prefixed DMA pairs. */
+struct bce_segment_list_header {
+    u64 element_count;
+    u64 data_size;
+    /* Chained VHCI segment lists cause CATERR; use separate submissions. */
+    u64 next_segl_addr;
+    u64 next_segl_length;
+};
+
+struct bce_segment_list_element {
+    u64 addr;
+    u64 length;
+};
+
+struct t2bce_dma_segment_list_chunk {
+    void *data;
+    dma_addr_t dma_addr;
+    size_t data_offset;
+    size_t data_size;
+};
+
+struct t2bce_dma_segment_list {
+    unsigned int chunk_count;
+    size_t data_size;
+    struct t2bce_dma_segment_list_chunk chunks[];
+};
+
+/* bridgeOS rejects a single segment-list descriptor after 32 elements. */
+#define BCE_SEGMENT_LIST_MAX_ELEMENTS 32U
+#define BCE_SEGMENT_LIST_ELEMENTS \
+    min_t(size_t, BCE_SEGMENT_LIST_MAX_ELEMENTS, \
+          (PAGE_SIZE - sizeof(struct bce_segment_list_header)) / \
+          sizeof(struct bce_segment_list_element))
+
 enum bce_submission_type {
     BCE_SUBMISSION_SINGLE,
     BCE_SUBMISSION_SEGMENT_LIST,
@@ -29,6 +67,8 @@ struct bce_submission {
             size_t size;
         } single;
         struct {
+            size_t offset;
+            size_t length;
             dma_addr_t addr;
             size_t size;
         } segment_list;
@@ -271,8 +311,8 @@ static void t2bce_dma_write_submission(struct bce_qe_submission *element, const 
         element->segl_length = 0;
         break;
     case BCE_SUBMISSION_SEGMENT_LIST:
-        element->addr = 0;
-        element->length = 0;
+        element->addr = submission->segment_list.offset;
+        element->length = submission->segment_list.length;
         element->segl_addr = submission->segment_list.addr;
         element->segl_length = submission->segment_list.size;
         break;
@@ -293,18 +333,149 @@ void t2bce_dma_set_next_submission_single(struct bce_queue_sq *sq, dma_addr_t ad
 }
 EXPORT_SYMBOL_GPL(t2bce_dma_set_next_submission_single);
 
-void t2bce_dma_set_next_submission_segment_list(struct bce_queue_sq *sq,
-        dma_addr_t segl_addr, size_t segl_size)
+int t2bce_dma_init_segment_list_pool(struct t2bce_dma_engine *dma)
 {
+    dma->segment_list_pool = dma_pool_create("t2bce_segment_lists",
+            dma->dma_dev, PAGE_SIZE, PAGE_SIZE, 0);
+    if (!dma->segment_list_pool)
+        return -ENOMEM;
+
+    return 0;
+}
+EXPORT_SYMBOL_GPL(t2bce_dma_init_segment_list_pool);
+
+void t2bce_dma_destroy_segment_list_pool(struct t2bce_dma_engine *dma)
+{
+    if (!dma->segment_list_pool)
+        return;
+
+    dma_pool_destroy(dma->segment_list_pool);
+    dma->segment_list_pool = NULL;
+}
+EXPORT_SYMBOL_GPL(t2bce_dma_destroy_segment_list_pool);
+
+struct t2bce_dma_segment_list *t2bce_dma_create_segment_list(
+        struct t2bce_dma_engine *dma, struct scatterlist *sgl,
+        unsigned int mapped_nents, gfp_t gfp)
+{
+    struct t2bce_dma_segment_list *list;
+    struct scatterlist *sg;
+    unsigned int chunk_count;
+    unsigned int i;
+    int status;
+
+    if (!dma->segment_list_pool || !sgl || !mapped_nents)
+        return ERR_PTR(-EINVAL);
+
+    chunk_count = DIV_ROUND_UP(mapped_nents, BCE_SEGMENT_LIST_ELEMENTS);
+    list = kzalloc(struct_size(list, chunks, chunk_count), gfp);
+    if (!list)
+        return ERR_PTR(-ENOMEM);
+    list->chunk_count = chunk_count;
+
+    for_each_sg(sgl, sg, mapped_nents, i) {
+        struct t2bce_dma_segment_list_chunk *chunk;
+        struct bce_segment_list_header *header;
+        struct bce_segment_list_element *elements;
+        unsigned int chunk_index = i / BCE_SEGMENT_LIST_ELEMENTS;
+        unsigned int element_index = i % BCE_SEGMENT_LIST_ELEMENTS;
+        size_t segment_size = sg_dma_len(sg);
+
+        chunk = &list->chunks[chunk_index];
+        if (!element_index) {
+            chunk->data = dma_pool_zalloc(dma->segment_list_pool, gfp,
+                    &chunk->dma_addr);
+            if (!chunk->data) {
+                status = -ENOMEM;
+                goto invalid;
+            }
+            chunk->data_offset = list->data_size;
+        }
+
+        if (!segment_size) {
+            status = -EINVAL;
+            goto invalid;
+        }
+        if (check_add_overflow(chunk->data_size, segment_size,
+                &chunk->data_size) ||
+            check_add_overflow(list->data_size, segment_size,
+                &list->data_size)) {
+            status = -EOVERFLOW;
+            goto invalid;
+        }
+
+        header = chunk->data;
+        elements = (struct bce_segment_list_element *)(header + 1);
+        elements[element_index].addr = sg_dma_address(sg);
+        elements[element_index].length = segment_size;
+        header->element_count++;
+        header->data_size = chunk->data_size;
+    }
+
+    return list;
+
+invalid:
+    t2bce_dma_destroy_segment_list(dma, list);
+    return ERR_PTR(status);
+}
+EXPORT_SYMBOL_GPL(t2bce_dma_create_segment_list);
+
+void t2bce_dma_destroy_segment_list(struct t2bce_dma_engine *dma,
+        struct t2bce_dma_segment_list *list)
+{
+    unsigned int i;
+
+    if (!list)
+        return;
+
+    for (i = 0; i < list->chunk_count; i++) {
+        struct t2bce_dma_segment_list_chunk *chunk = &list->chunks[i];
+
+        if (chunk->data)
+            dma_pool_free(dma->segment_list_pool, chunk->data,
+                    chunk->dma_addr);
+    }
+    kfree(list);
+}
+EXPORT_SYMBOL_GPL(t2bce_dma_destroy_segment_list);
+
+int t2bce_dma_set_next_submission_segment_list(struct bce_queue_sq *sq,
+        const struct t2bce_dma_segment_list *list, size_t offset, size_t size,
+        size_t *submitted_size)
+{
+    const struct t2bce_dma_segment_list_chunk *chunk = NULL;
     struct bce_submission submission = {
         .type = BCE_SUBMISSION_SEGMENT_LIST,
-        .segment_list = {
-            .addr = segl_addr,
-            .size = segl_size,
-        },
     };
+    unsigned int i;
+    size_t chunk_offset;
+
+    if (!list || !submitted_size || !size || offset >= list->data_size ||
+        size > list->data_size - offset)
+        return -EINVAL;
+
+    for (i = 0; i < list->chunk_count; i++) {
+        const struct t2bce_dma_segment_list_chunk *candidate =
+                &list->chunks[i];
+
+        if (offset >= candidate->data_offset &&
+            offset - candidate->data_offset < candidate->data_size) {
+            chunk = candidate;
+            break;
+        }
+    }
+    if (!chunk)
+        return -EINVAL;
+
+    chunk_offset = offset - chunk->data_offset;
+    *submitted_size = min(size, chunk->data_size - chunk_offset);
+    submission.segment_list.offset = chunk_offset;
+    submission.segment_list.length = *submitted_size;
+    submission.segment_list.addr = chunk->dma_addr;
+    submission.segment_list.size = PAGE_SIZE;
 
     t2bce_dma_write_submission(t2bce_dma_next_submission(sq), &submission);
+    return 0;
 }
 EXPORT_SYMBOL_GPL(t2bce_dma_set_next_submission_segment_list);
 

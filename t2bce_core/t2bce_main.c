@@ -154,8 +154,11 @@ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto fail_interrupt;
     }
 
-    if ((status = bce_alloc_state_buffer(bce)))
+    if ((status = t2bce_dma_init_segment_list_pool(&bce->dma)))
         goto fail_interrupt;
+
+    if ((status = bce_alloc_state_buffer(bce)))
+        goto fail_segment_list_pool;
 
     /*
      * DMA on the BCE function depends on function 0 also being bus master.
@@ -196,6 +199,8 @@ fail_ts:
 fail_dev0:
 #endif
     pci_dev_put(bce->pci0);
+fail_segment_list_pool:
+    t2bce_dma_destroy_segment_list_pool(&bce->dma);
 fail_interrupt:
     pci_free_irq(dev, 4, dev);
 fail_interrupt_0:
@@ -446,6 +451,7 @@ static void t2bce_remove(struct pci_dev *dev)
     pci_free_irq(dev, 0, dev);
     pci_free_irq(dev, 4, dev);
     bce_free_command_queues(bce);
+    t2bce_dma_destroy_segment_list_pool(&bce->dma);
     pci_iounmap(dev, bce->reg_mem_mb);
     pci_iounmap(dev, bce->reg_mem_dma);
     device_destroy(bce_class, bce->devt);

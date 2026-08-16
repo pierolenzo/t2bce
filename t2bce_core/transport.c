@@ -352,10 +352,31 @@ void t2bce_core_set_next_submission_single(struct t2bce_core_queue_sq *sq, dma_a
 }
 EXPORT_SYMBOL_GPL(t2bce_core_set_next_submission_single);
 
-void t2bce_core_set_next_submission_segment_list(struct t2bce_core_queue_sq *sq,
-        dma_addr_t segl_addr, size_t segl_size)
+struct t2bce_core_segment_list *t2bce_core_create_segment_list(
+        struct t2bce_core_client *client, struct scatterlist *sgl,
+        unsigned int mapped_nents, gfp_t gfp)
 {
-    t2bce_dma_set_next_submission_segment_list(to_bce_sq(sq), segl_addr, segl_size);
+    return (struct t2bce_core_segment_list *)
+            t2bce_dma_create_segment_list(&client->bce->dma, sgl,
+                    mapped_nents, gfp);
+}
+EXPORT_SYMBOL_GPL(t2bce_core_create_segment_list);
+
+void t2bce_core_destroy_segment_list(struct t2bce_core_client *client,
+        struct t2bce_core_segment_list *list)
+{
+    t2bce_dma_destroy_segment_list(&client->bce->dma,
+            (struct t2bce_dma_segment_list *)list);
+}
+EXPORT_SYMBOL_GPL(t2bce_core_destroy_segment_list);
+
+int t2bce_core_set_next_submission_segment_list(struct t2bce_core_queue_sq *sq,
+        const struct t2bce_core_segment_list *list, size_t offset, size_t size,
+        size_t *submitted_size)
+{
+    return t2bce_dma_set_next_submission_segment_list(to_bce_sq(sq),
+            (const struct t2bce_dma_segment_list *)list, offset, size,
+            submitted_size);
 }
 EXPORT_SYMBOL_GPL(t2bce_core_set_next_submission_segment_list);
 

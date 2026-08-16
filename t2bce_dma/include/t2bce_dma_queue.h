@@ -2,7 +2,9 @@
 #define T2BCE_DMA_QUEUE_H
 
 #include <linux/completion.h>
+#include <linux/gfp_types.h>
 #include <linux/pci.h>
+#include <linux/scatterlist.h>
 
 #define BCE_CMD_SIZE 0x40
 #define BCE_MAX_QUEUE_COUNT 0x100
@@ -10,12 +12,9 @@
 #define BCE_QUEUE_USER_MIN 2
 #define BCE_QUEUE_USER_MAX (BCE_MAX_QUEUE_COUNT - 1)
 
-struct t2bce_dma_segment {
-    u64 addr;
-    u64 length;
-};
-
 struct bce_queue_memcfg;
+struct dma_pool;
+struct t2bce_dma_segment_list;
 
 struct t2bce_dma_engine_ops {
     int (*register_queue)(void *userdata, struct bce_queue_memcfg *cfg,
@@ -92,6 +91,7 @@ struct t2bce_dma_engine {
     struct ida queue_ida;
     struct bce_queue_cq *cmd_cq;
     struct bce_queue_cmdq *cmd_cmdq;
+    struct dma_pool *segment_list_pool;
     struct bce_queue_sq *int_sq_list[BCE_MAX_QUEUE_COUNT];
     bool is_being_removed;
 };
@@ -157,8 +157,16 @@ void t2bce_dma_submit_to_device(struct bce_queue_sq *sq);
 void t2bce_dma_notify_submission_complete(struct bce_queue_sq *sq);
 
 void t2bce_dma_set_next_submission_single(struct bce_queue_sq *sq, dma_addr_t addr, size_t size);
-void t2bce_dma_set_next_submission_segment_list(struct bce_queue_sq *sq,
-        dma_addr_t segl_addr, size_t segl_size);
+int t2bce_dma_init_segment_list_pool(struct t2bce_dma_engine *dma);
+void t2bce_dma_destroy_segment_list_pool(struct t2bce_dma_engine *dma);
+struct t2bce_dma_segment_list *t2bce_dma_create_segment_list(
+        struct t2bce_dma_engine *dma, struct scatterlist *sgl,
+        unsigned int mapped_nents, gfp_t gfp);
+void t2bce_dma_destroy_segment_list(struct t2bce_dma_engine *dma,
+        struct t2bce_dma_segment_list *list);
+int t2bce_dma_set_next_submission_segment_list(struct bce_queue_sq *sq,
+        const struct t2bce_dma_segment_list *list, size_t offset, size_t size,
+        size_t *submitted_size);
 
 struct bce_queue_cmdq *t2bce_dma_alloc_cmdq(struct t2bce_dma_engine *dma, int qid, u32 el_count);
 void t2bce_dma_free_cmdq(struct t2bce_dma_engine *dma, struct bce_queue_cmdq *cmdq);
