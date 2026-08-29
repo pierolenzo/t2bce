@@ -2,6 +2,8 @@
 #define T2AUDIO_H
 
 #include <linux/types.h>
+#include <linux/hrtimer.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <sound/pcm.h>
 #include "t2bce_core_transport.h"
@@ -21,6 +23,7 @@ struct snd_card;
 struct snd_pcm;
 struct snd_pcm_hardware;
 struct snd_jack;
+struct dentry;
 
 struct __attribute__((packed)) __attribute__((aligned(4))) t2audio_buffer_struct_buffer {
     size_t address;
@@ -76,13 +79,22 @@ struct t2audio_stream {
     struct snd_pcm_hardware *alsa_hw_desc;
     u32 latency;
 
+    struct hrtimer playback_timer;
+    spinlock_t playback_lock;
+    struct snd_pcm_substream *playback_substream;
+    void *playback_area;
+    size_t playback_bytes;
+    ktime_t playback_last;
+    u64 playback_remainder;
+    u64 playback_frames;
+    snd_pcm_uframes_t bridge_pos;
+    snd_pcm_uframes_t period_pos;
+    bool playback_timer_initialized;
+
     bool waiting_for_first_ts;
 
     ktime_t remote_timestamp;
     ktime_t timestamp_accept_after;
-    s64 clock_offset_ns;
-    u64 timestamp_seed;
-    bool clock_offset_valid;
     snd_pcm_sframes_t frame_min;
     int started;
 };
@@ -118,6 +130,7 @@ struct t2audio_device {
     u32 __iomem *reg_mem_gpr;
 
     struct t2audio_buffer_struct *bs;
+    struct dentry *debugfs_dir;
 
     struct t2bce_core_client *bce;
     struct t2audio_bce bcem;
@@ -132,10 +145,6 @@ struct t2audio_device {
     bool resume_deferred;
     bool pm_quiesced;
 
-    spinlock_t clock_lock;
-    s64 clock_offset_ns;
-    u32 clock_samples;
-    bool clock_offset_valid;
 };
 
 void t2audio_handle_notification(struct t2audio_device *a, struct t2audio_msg *msg);

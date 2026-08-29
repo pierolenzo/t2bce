@@ -10,6 +10,8 @@
 #include "audio.h"
 #include "pcm.h"
 #include <linux/version.h>
+#include <linux/debugfs.h>
+#include <linux/uaccess.h>
 
 static int t2audio_alsa_index = SNDRV_DEFAULT_IDX1;
 static char *t2audio_alsa_id = SNDRV_DEFAULT_STR1;
@@ -23,11 +25,11 @@ static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_i
 static void t2audio_free_dev(struct t2audio_subdevice *sdev);
 static void t2audio_reset_stream(struct t2audio_stream *stream);
 static void t2audio_reset_streams(struct t2audio_device *a);
-static void t2audio_reset_clock(struct t2audio_device *a);
 static void t2audio_resume_work(struct work_struct *ws);
 static void t2audio_resume_complete(void *userdata);
 static void t2audio_pm_prepare_client(void *userdata);
 static void t2audio_pm_shutdown_client(void *userdata);
+static int t2audio_debugfs_init(struct t2audio_device *a);
 
 static const struct t2bce_core_client_pm_ops t2audio_pm_ops = {
         .shutdown = t2audio_pm_shutdown_client,
@@ -80,9 +82,6 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
     init_completion(&t2audio->remote_alive);
     INIT_WORK(&t2audio->resume_work, t2audio_resume_work);
     INIT_LIST_HEAD(&t2audio->subdevice_list);
-    spin_lock_init(&t2audio->clock_lock);
-    t2audio->clock_samples = 0;
-    t2audio->clock_offset_valid = false;
 
     /* Init: set an unknown flag in the bitset */
     if (pci_read_config_dword(dev, 4, &cfg))
@@ -128,6 +127,12 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto fail_snd;
     }
 
+    status = t2audio_debugfs_init(t2audio);
+    if (status) {
+        dev_err(&dev->dev, "t2bce_audio: Failed to initialize debugfs: %d\n", status);
+        goto fail_snd;
+    }
+
     if ((status = t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON))) {
         dev_err(&dev->dev, "Failed to set remote access\n");
         goto fail_snd;
@@ -151,6 +156,8 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
     return 0;
 
 fail_snd:
+    debugfs_remove_recursive(t2audio->debugfs_dir);
+    t2audio->debugfs_dir = NULL;
     snd_card_free(t2audio->card);
     while (!list_empty(&t2audio->subdevice_list)) {
         sdev = list_first_entry(&t2audio->subdevice_list,
@@ -188,6 +195,8 @@ static void t2audio_remove(struct pci_dev *dev)
     struct t2audio_device *t2audio = pci_get_drvdata(dev);
 
     cancel_work_sync(&t2audio->resume_work);
+    debugfs_remove_recursive(t2audio->debugfs_dir);
+    t2audio->debugfs_dir = NULL;
     snd_card_free(t2audio->card);
     while (!list_empty(&t2audio->subdevice_list)) {
         sdev = list_first_entry(&t2audio->subdevice_list, struct t2audio_subdevice, list);
@@ -225,7 +234,7 @@ static int t2audio_quiesce(struct t2audio_device *t2audio, bool suspend_pcm)
             if (!smp_load_acquire(&sdev->out_streams[i].started))
                 continue;
             stopped_io = true;
-            smp_store_release(&sdev->out_streams[i].started, 0);
+            t2audio_pcm_quiesce_stream(&sdev->out_streams[i]);
         }
 
         for (i = 0; i < sdev->in_stream_cnt; i++) {
@@ -259,7 +268,7 @@ static int t2audio_suspend(struct device *dev)
     pr_debug("t2bce_audio: suspend entry\n");
     status = t2audio_quiesce(t2audio, true);
     pci_disable_device(t2audio->pci);
-    pr_info("t2bce_audio: suspend exit status=%d\n", status);
+    pr_debug("t2bce_audio: suspend exit status=%d\n", status);
     return 0;
 }
 
@@ -281,7 +290,7 @@ static void t2audio_shutdown(struct pci_dev *dev)
         return;
 
     /*
-     * Shutdown is not remove: keep allocations intact, but stop active audio
+     * Keep allocations intact, but stop active audio
      * IO and revoke remote access while the BCE command transport is still
      * alive. The t2bce shutdown path will close the shared bus afterwards.
      */
@@ -297,7 +306,7 @@ static int t2audio_resume(struct device *dev)
     const char *path = no_state_resume ? "no-state" : "stateful";
 
     if ((status = pci_enable_device(t2audio->pci))) {
-        pr_info("t2bce_audio: resume exit status=%d path=%s\n", status, path);
+        pr_debug("t2bce_audio: resume exit status=%d path=%s\n", status, path);
         return status;
     }
     pci_set_master(t2audio->pci);
@@ -310,16 +319,15 @@ static int t2audio_resume(struct device *dev)
 
     if ((status = t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON))) {
         dev_err(t2audio->dev, "Failed to set remote access\n");
-        pr_info("t2bce_audio: resume exit status=%d path=%s\n", status, path);
+        pr_debug("t2bce_audio: resume exit status=%d path=%s\n", status, path);
         return status;
     }
 
     t2audio->resume_deferred = false;
     t2audio->pm_quiesced = false;
-    t2audio_reset_clock(t2audio);
     t2audio_reset_streams(t2audio);
 
-    pr_info("t2bce_audio: resume exit status=0 path=%s\n", path);
+    pr_debug("t2bce_audio: resume exit status=0 path=%s\n", path);
     return 0;
 }
 
@@ -333,15 +341,14 @@ static void t2audio_resume_work(struct work_struct *ws)
     if (t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON)) {
         t2audio->resume_deferred = false;
         dev_err(t2audio->dev, "Deferred remote access enable failed\n");
-        pr_info("t2bce_audio: resume deferred path failed\n");
+        pr_debug("t2bce_audio: resume deferred path failed\n");
         return;
     }
 
     t2audio->resume_deferred = false;
     t2audio->pm_quiesced = false;
-    t2audio_reset_clock(t2audio);
     t2audio_reset_streams(t2audio);
-    pr_info("t2bce_audio: resume deferred path complete\n");
+    pr_debug("t2bce_audio: resume deferred path complete\n");
 }
 
 static void t2audio_resume_complete(void *userdata)
@@ -356,25 +363,11 @@ static void t2audio_resume_complete(void *userdata)
 
 static void t2audio_reset_stream(struct t2audio_stream *stream)
 {
-    smp_store_release(&stream->started, 0);
+    t2audio_pcm_quiesce_stream(stream);
     stream->waiting_for_first_ts = true;
     stream->remote_timestamp = 0;
     stream->timestamp_accept_after = 0;
-    stream->clock_offset_ns = 0;
-    stream->timestamp_seed = 0;
-    stream->clock_offset_valid = false;
     stream->frame_min = stream->latency;
-}
-
-static void t2audio_reset_clock(struct t2audio_device *a)
-{
-    unsigned long flags;
-
-    spin_lock_irqsave(&a->clock_lock, flags);
-    a->clock_offset_ns = 0;
-    a->clock_samples = 0;
-    a->clock_offset_valid = false;
-    spin_unlock_irqrestore(&a->clock_lock, flags);
 }
 
 static void t2audio_reset_streams(struct t2audio_device *a)
@@ -648,6 +641,72 @@ static int t2audio_init_bs(struct t2audio_device *a)
     return 0;
 }
 
+static ssize_t t2audio_debugfs_buffer_struct_read(struct file *file,
+        char __user *user_buf, size_t count, loff_t *ppos)
+{
+    struct t2audio_device *a = file->private_data;
+    const size_t total = sizeof(*a->bs);
+    size_t done = 0;
+    u8 *buf;
+
+    if (*ppos < 0)
+        return -EINVAL;
+    if ((size_t)*ppos >= total || !count)
+        return 0;
+
+    count = min_t(size_t, count, total - (size_t)*ppos);
+    buf = kmalloc(min_t(size_t, count, PAGE_SIZE), GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    while (done < count) {
+        size_t chunk = min_t(size_t, count - done, PAGE_SIZE);
+
+        memcpy_fromio(buf, (u8 __iomem *)a->bs + (size_t)*ppos + done,
+                      chunk);
+        if (copy_to_user(user_buf + done, buf, chunk)) {
+            kfree(buf);
+            return done ? (ssize_t)done : -EFAULT;
+        }
+        done += chunk;
+    }
+
+    kfree(buf);
+    *ppos += done;
+    return done;
+}
+
+static const struct file_operations t2audio_debugfs_buffer_struct_fops = {
+        .owner = THIS_MODULE,
+        .open = simple_open,
+        .read = t2audio_debugfs_buffer_struct_read,
+        .llseek = default_llseek,
+};
+
+static int t2audio_debugfs_init(struct t2audio_device *a)
+{
+    struct dentry *file;
+    int status;
+
+    a->debugfs_dir = debugfs_create_dir("t2bce_audio", NULL);
+    if (IS_ERR_OR_NULL(a->debugfs_dir)) {
+        status = a->debugfs_dir ? PTR_ERR(a->debugfs_dir) : -ENOMEM;
+        a->debugfs_dir = NULL;
+        return status;
+    }
+
+    file = debugfs_create_file("buffer_struct", 0400, a->debugfs_dir, a,
+                               &t2audio_debugfs_buffer_struct_fops);
+    if (IS_ERR_OR_NULL(file)) {
+        status = file ? PTR_ERR(file) : -ENOMEM;
+        debugfs_remove_recursive(a->debugfs_dir);
+        a->debugfs_dir = NULL;
+        return status;
+    }
+
+    return 0;
+}
+
 static void t2audio_init_bs_stream(struct t2audio_device *a, struct t2audio_stream *strm,
                                   struct t2audio_buffer_struct_stream *bs_strm)
 {
@@ -816,36 +875,17 @@ void t2audio_handle_prop_change(struct t2audio_device *a, struct t2audio_msg *ms
 void t2audio_handle_cmd_timestamp(struct t2audio_device *a, struct t2audio_msg *msg)
 {
     ktime_t time_os = ktime_get_boottime();
-    unsigned long flags;
     struct t2audio_send_ctx sctx;
     struct t2audio_subdevice *sdev;
-    bool clock_ready;
-    s64 clock_offset_ns;
-    s64 offset_sample;
     u64 devid, timestamp, update_seed;
     t2audio_msg_read_update_timestamp(msg, &devid, &timestamp, &update_seed);
 
-    offset_sample = ktime_to_ns(time_os) - (s64)timestamp;
-    spin_lock_irqsave(&a->clock_lock, flags);
-    if (offset_sample >= 0) {
-        if (!a->clock_offset_valid || offset_sample < a->clock_offset_ns) {
-            a->clock_offset_ns = offset_sample;
-            a->clock_offset_valid = true;
-        }
-        if (a->clock_samples < 2)
-            a->clock_samples++;
-    }
-    clock_offset_ns = a->clock_offset_ns;
-    clock_ready = a->clock_samples >= 2;
-    spin_unlock_irqrestore(&a->clock_lock, flags);
-    pr_debug("t2bce_audio: timestamp dev=%llx t2=%llx host=%lld seed=%llx sample_offset=%lld clock_offset=%lld\n",
-            devid, timestamp, ktime_to_ns(time_os), update_seed,
-            offset_sample, clock_offset_ns);
+    pr_debug("t2bce_audio: timestamp dev=%llx t2=%llx host=%lld seed=%llx\n",
+            devid, timestamp, ktime_to_ns(time_os), update_seed);
 
     sdev = t2audio_find_dev_by_dev_id(a, devid);
     if (sdev)
-        t2audio_handle_timestamp(sdev, timestamp, update_seed, clock_offset_ns,
-                clock_ready);
+        t2audio_handle_timestamp(sdev, time_os);
 
     t2audio_send_cmd_response(a, &sctx, msg,
             t2audio_msg_write_update_timestamp_response);
@@ -906,7 +946,7 @@ static int __init t2audio_module_init(void)
     result = pci_register_driver(&t2audio_pci_driver);
     if (result)
         goto fail_drv;
-    pr_info("t2bce_audio: module initialized\n");
+    pr_debug("t2bce_audio: module initialized\n");
     return 0;
 
 fail_drv:
@@ -917,7 +957,7 @@ fail_chrdev:
     unregister_chrdev_region(t2audio_chrdev, 1);
     if (!result)
         result = -EINVAL;
-    pr_info("t2bce_audio: module init failed status=%d\n", result);
+    pr_debug("t2bce_audio: module init failed status=%d\n", result);
     return result;
 }
 
@@ -926,7 +966,7 @@ static void __exit t2audio_module_exit(void)
     pci_unregister_driver(&t2audio_pci_driver);
     class_destroy(t2audio_class);
     unregister_chrdev_region(t2audio_chrdev, 1);
-    pr_info("t2bce_audio: module exited\n");
+    pr_debug("t2bce_audio: module exited\n");
 }
 
 struct t2audio_alsa_pcm_id_mapping t2audio_alsa_id_mappings[] = {
@@ -946,6 +986,6 @@ MODULE_SOFTDEP("pre: t2bce_core");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("André Eikmeyer <andre.eikmeyer@gmail.com>");
 MODULE_DESCRIPTION("Apple T2 Audio Driver");
-MODULE_VERSION("0.01");
+MODULE_VERSION("0.02");
 module_init(t2audio_module_init);
 module_exit(t2audio_module_exit);
