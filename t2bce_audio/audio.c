@@ -152,6 +152,12 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 fail_snd:
     snd_card_free(t2audio->card);
+    while (!list_empty(&t2audio->subdevice_list)) {
+        sdev = list_first_entry(&t2audio->subdevice_list,
+                                struct t2audio_subdevice, list);
+        list_del(&sdev->list);
+        t2audio_free_dev(sdev);
+    }
 fail:
     if (t2audio) {
         if (t2audio->dev)
@@ -523,10 +529,20 @@ static void t2audio_free_dev(struct t2audio_subdevice *sdev)
 {
     size_t i;
     for (i = 0; i < sdev->in_stream_cnt; i++) {
+        struct t2audio_dma_buf *buf = sdev->in_streams[i].buffers;
+
         if (sdev->in_streams[i].alsa_hw_desc)
             kfree(sdev->in_streams[i].alsa_hw_desc);
-        if (sdev->in_streams[i].buffers)
-            kfree(sdev->in_streams[i].buffers);
+        if (buf) {
+            size_t j;
+
+            for (j = 0; j < sdev->in_streams[i].buffer_cnt; j++) {
+                if (buf[j].type == T2AUDIO_DMA_BUF_COHERENT)
+                    dma_free_coherent(&sdev->a->pci->dev, buf[j].size,
+                                      buf[j].ptr, buf[j].dma_addr);
+            }
+            kfree(buf);
+        }
     }
     for (i = 0; i < sdev->out_stream_cnt; i++) {
         if (sdev->out_streams[i].alsa_hw_desc)
@@ -687,6 +703,11 @@ static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio
     strm->buffers = kmalloc_array(strm->buffer_cnt, sizeof(struct t2audio_dma_buf), GFP_KERNEL);
     if (!strm->buffers) {
         dev_err(a->dev, "Buffer list allocation failed\n");
+        dma_free_coherent(&a->pci->dev, size, dma_ptr, dma_addr);
+        bs_strm->buffers[0].address = 0;
+        bs_strm->buffers[0].size = 0;
+        bs_strm->num_buffers = 0;
+        strm->buffer_cnt = 0;
         return;
     }
     strm->buffers[0].dma_addr = dma_addr;
