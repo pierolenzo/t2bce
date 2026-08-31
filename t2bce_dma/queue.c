@@ -619,7 +619,7 @@ static void __exit t2bce_dma_module_exit(void)
 module_init(t2bce_dma_module_init);
 module_exit(t2bce_dma_module_exit);
 
-MODULE_AUTHOR("André Eikmeyer <andre.eikmeyer@gmail.com>");
+MODULE_AUTHOR("André Eikmeyer <andre.eikmeyer@kait2en.org>");
 MODULE_DESCRIPTION("Apple T2 BCE DMA queue engine");
 MODULE_VERSION("0.01");
 MODULE_LICENSE("GPL");

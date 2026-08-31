@@ -144,7 +144,7 @@ make && sudo make install
 sudo depmod -a
 sudo reboot
 ```
-After reboot type `modinfo t2bce_core`. The output should show a version number > `0.04` and `author: André Eikmeyer <andre.eikmeyer@gmail.com>`
+After reboot type `modinfo t2bce_core`. The output should show a version number > `0.04` and `author: André Eikmeyer <andre.eikmeyer@kait2en.org>`
  
 
 ## DKMS
