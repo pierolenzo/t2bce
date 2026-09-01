@@ -149,24 +149,10 @@ After reboot type `modinfo t2bce_core`. The output should show a version number 
 
 ## DKMS
 
-Install the source tree and register the module with DKMS (t2bce_core version 0.06 as example here):
-
-```bash
-version=0.06
-sudo install -d "/usr/src/t2bce_core-${version}"
-git archive --format=tar HEAD | sudo tar -x -C "/usr/src/t2bce_core-${version}"
-sudo dkms add -m t2bce_core -v "${version}"
-sudo dkms install -m t2bce_core -v "${version}"
-```
-
-DKMS will automatically rebuild the module for newly installed kernels.
-
-To remove the DKMS installation:
-
-```bash
-sudo dkms remove -m t2bce_core -v 0.06 --all
-sudo rm -rf /usr/src/t2bce_core-0.06
-```
+The Fedora installer registers `t2bce_core` together with `t2bce_dma`,
+`t2bce_vhci`, and `t2bce_audio` as the single `t2bce_stack` DKMS package. This
+keeps their exported symbols and ABI synchronized. Do not register this source
+directory as a separate DKMS package.
 
 ## Support
 
