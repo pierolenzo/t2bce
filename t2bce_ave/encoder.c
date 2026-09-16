@@ -323,8 +323,13 @@ int t2bce_ave_session_setup(struct t2bce_ave_session *session, struct t2bce_core
 		goto fail_queues;
 	}
 
-	if (params->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) {
-		status = t2bce_ave_send_set_property_bool(session, "ConstantBitRate", true);
+	/* AverageBitRate alone leaves the AVE in constant-QP; the rate control is
+	 * only engaged once ConstantBitRate is set, so send it for VBR (false)
+	 * as well as CBR (true). CQ uses Quality instead. */
+	if (params->bitrate_mode != V4L2_MPEG_VIDEO_BITRATE_MODE_CQ) {
+		bool cbr = params->bitrate_mode == V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
+
+		status = t2bce_ave_send_set_property_bool(session, "ConstantBitRate", cbr);
 		if (status == -ETIMEDOUT)
 			goto fail_queues;
 		if (status)
