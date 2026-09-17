@@ -375,6 +375,7 @@ static int bce_vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u1
 {
     struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
     int status;
+    int port;
     struct usb_hub_descriptor *hd;
     struct usb_hub_status *hs;
     struct usb_port_status *ps;
@@ -385,9 +386,16 @@ static int bce_vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u1
         hd->bDescLength = sizeof(struct usb_hub_descriptor);
         hd->bDescriptorType = USB_DT_HUB;
         hd->bNbrPorts = (u8) vhci->port_count;
-        hd->wHubCharacteristics = HUB_CHAR_INDV_PORT_LPSM | HUB_CHAR_INDV_PORT_OCPM;
+        hd->wHubCharacteristics = cpu_to_le16(HUB_CHAR_INDV_PORT_LPSM |
+                                              HUB_CHAR_INDV_PORT_OCPM |
+                                              HUB_CHAR_COMPOUND);
         hd->bPwrOn2PwrGood = 0;
         hd->bHubContrCurrent = 0;
+
+        /* All devices exposed by the T2 virtual hub are built into the system. */
+        for (port = 1; port <= vhci->port_count; port++)
+            hd->u.hs.DeviceRemovable[port / 8] |= BIT(port % 8);
+
         return 0;
     } else if (typeReq == GetHubStatus && wLength >= sizeof(struct usb_hub_status)) {
         hs = (struct usb_hub_status *) buf;
