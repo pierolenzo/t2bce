@@ -37,4 +37,17 @@ config T2BCE_AUDIO
 
 	  If compiled as a module, it will be called t2bce_audio.
 
+config T2BCE_AVE
+	tristate "Apple T2 audio video encoder support"
+	depends on T2BCE_CORE
+	depends on MEDIA_SUPPORT && I2C
+	depends on VIDEO_DEV
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_CORE
+	select VIDEOBUF2_VMALLOC
+	help
+	  Driver to support audio and video encoder present on the T2 Chip.
+
+	  If compiled as a module, it will be called t2bce_ave.
+
 endmenu

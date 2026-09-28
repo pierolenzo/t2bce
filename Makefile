@@ -3,12 +3,14 @@ KDIR ?= /lib/modules/$(KVERSION)/build
 PWD := $(shell pwd)
 MODDEST ?= /lib/modules/$(KVERSION)/extra/t2bce
 
-MODULE_DIRS := t2bce_dma t2bce_core t2bce_vhci t2bce_audio
+MODULE_DIRS := t2bce_dma t2bce_core t2bce_vhci t2bce_audio t2bce_ave t2sep
 MODULES := \
 	t2bce_dma/t2bce_dma.ko \
 	t2bce_core/t2bce_core.ko \
 	t2bce_vhci/t2bce_vhci.ko \
-	t2bce_audio/t2bce_audio.ko
+	t2bce_audio/t2bce_audio.ko \
+	t2bce_ave/t2bce_ave.ko \
+	t2sep/t2sep.ko
 
 .PHONY: all clean install install-modules install-ucm uninstall uninstall-modules uninstall-ucm modules_prepare
 
@@ -17,6 +19,8 @@ all: modules_prepare
 	$(MAKE) -C t2bce_core KVERSION=$(KVERSION) T2BCE_DMA_SRC=../t2bce_dma
 	$(MAKE) -C t2bce_vhci KVERSION=$(KVERSION) T2BCE_CORE_SRC=../t2bce_core
 	$(MAKE) -C t2bce_audio KVERSION=$(KVERSION) T2BCE_CORE_SRC=../t2bce_core
+	$(MAKE) -C t2bce_ave KVERSION=$(KVERSION) T2BCE_CORE_SRC=../t2bce_core
+	$(MAKE) -C t2sep KVERSION=$(KVERSION)
 
 modules_prepare:
 	@test -d "$(KDIR)" || { echo "Kernel build directory not found: $(KDIR)"; exit 1; }

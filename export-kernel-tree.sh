@@ -26,7 +26,7 @@ fi
 mkdir -p "$dest_dir"
 cp "$src_dir/kernel/Kconfig" "$src_dir/kernel/Makefile" "$dest_dir/"
 
-for module in t2bce_dma t2bce_core t2bce_vhci t2bce_audio; do
+for module in t2bce_dma t2bce_core t2bce_vhci t2bce_audio t2bce_ave; do
 	mkdir -p "$dest_dir/$module"
 	find "$src_dir/$module" -maxdepth 1 -type f \( -name '*.c' -o -name '*.h' \) \
 		-exec cp '{}' "$dest_dir/$module/" ';'
