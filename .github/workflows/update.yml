@@ -31,8 +31,8 @@ jobs:
 
       - name: Push changes to the patches
         run: |
-          git clone https://github.com/t2linux/linux-t2-patches
+          git clone https://github.com/pierolenzo/linux-t2-patches.git
           cd linux-t2-patches
-          gh workflow run bce.yml
+          gh workflow run bce.yml -f fork="https://github.com/${{ github.repository }}" -f branch="${{ github.ref_name }}"
         env:
           GH_TOKEN: ${{ secrets.PAT }}
