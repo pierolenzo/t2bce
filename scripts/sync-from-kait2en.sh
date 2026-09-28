@@ -55,6 +55,9 @@ echo "Current upstream HEAD:       $HEAD_SYNC"
 
 if [ "$LAST_SYNC" = "$HEAD_SYNC" ]; then
   echo "Already up to date. No new upstream commits."
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "synced=false" >> "$GITHUB_OUTPUT"
+  fi
   exit 0
 fi
 
@@ -64,6 +67,9 @@ COMMITS=$(git -C "$UPSTREAM_DIR" log --reverse --format="%H" "$LAST_SYNC..$HEAD_
 if [ -z "$COMMITS" ]; then
   echo "No upstream commits modified the tracked module paths between $LAST_SYNC and $HEAD_SYNC."
   echo "$HEAD_SYNC" > "$SYNC_FILE"
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "synced=false" >> "$GITHUB_OUTPUT"
+  fi
   exit 0
 fi
 
@@ -144,3 +150,6 @@ done
 
 echo "$HEAD_SYNC" > "$SYNC_FILE"
 echo "Successfully synchronized all $TOTAL upstream commits up to $HEAD_SYNC."
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  echo "synced=true" >> "$GITHUB_OUTPUT"
+fi

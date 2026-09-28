@@ -2,6 +2,8 @@
 name: Update t2bce
 
 on:
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 jobs:
@@ -24,12 +26,14 @@ jobs:
           ./scripts/sync-from-kait2en.sh
 
       - name: Push changes to the repo
+        if: steps.publish.outputs.synced == 'true'
         uses: ad-m/github-push-action@master
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ github.ref }}
 
       - name: Push changes to the patches
+        if: steps.publish.outputs.synced == 'true'
         run: |
           git clone https://github.com/pierolenzo/linux-t2-patches.git
           cd linux-t2-patches
