@@ -65,8 +65,9 @@ static int __init t2bce_ave_init(void)
 		goto err_class;
 	}
 	t2bce_ave->core_dev = t2bce_core_device_get();
-	if (!t2bce_ave->core_dev) {
-		ret = -EPROBE_DEFER;
+	if (IS_ERR(t2bce_ave->core_dev)) {
+		ret = PTR_ERR(t2bce_ave->core_dev);
+		t2bce_ave->core_dev = NULL;
 		goto err_state;
 	}
 	t2bce_ave->dev = device_create(t2bce_ave_class, t2bce_ave->core_dev,
