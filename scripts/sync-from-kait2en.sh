@@ -41,13 +41,16 @@ else
 fi
 
 # 2. Determine synchronization baseline
-# Default baseline: commit f1b26d295dbc718df8714c0364ef81aa3a0ff426 (matching 45db242 in t2bce)
-if [ ! -f "$SYNC_FILE" ]; then
-  echo "No sync state file found. Initializing baseline to f1b26d295dbc718df8714c0364ef81aa3a0ff426..."
-  echo "f1b26d295dbc718df8714c0364ef81aa3a0ff426" > "$SYNC_FILE"
+# Prioritize upstream trailer in git history, then fallback to sync state file,
+# and finally default initial baseline f1b26d295dbc718df8714c0364ef81aa3a0ff426
+LAST_SYNC=$(git -C "$REPO_ROOT" log -1 --grep="Upstream:" --format="%B" 2>/dev/null | grep -oE "kaiT2en/KaiT2en-Fedora/commit/[0-9a-f]{7,40}" | head -n1 | cut -d/ -f4 || echo "")
+if [ -z "$LAST_SYNC" ] && [ -f "$SYNC_FILE" ]; then
+  LAST_SYNC=$(tr -d '[:space:]' < "$SYNC_FILE")
+fi
+if [ -z "$LAST_SYNC" ]; then
+  LAST_SYNC="f1b26d295dbc718df8714c0364ef81aa3a0ff426"
 fi
 
-LAST_SYNC=$(tr -d '[:space:]' < "$SYNC_FILE")
 HEAD_SYNC=$(git -C "$UPSTREAM_DIR" rev-parse origin/main)
 
 echo "Last synced upstream commit: $LAST_SYNC"
@@ -66,7 +69,6 @@ COMMITS=$(git -C "$UPSTREAM_DIR" log --reverse --format="%H" "$LAST_SYNC..$HEAD_
 
 if [ -z "$COMMITS" ]; then
   echo "No upstream commits modified the tracked module paths between $LAST_SYNC and $HEAD_SYNC."
-  echo "$HEAD_SYNC" > "$SYNC_FILE"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
     echo "synced=false" >> "$GITHUB_OUTPUT"
   fi
@@ -79,6 +81,8 @@ trap 'rm -rf "$PATCH_TMP"' EXIT
 TOTAL=$(echo "$COMMITS" | wc -w)
 COUNT=0
 echo "Found $TOTAL commits to import from upstream."
+
+APPLIED_COMMITS=0
 
 # 4. Process and apply each commit
 for commit in $COMMITS; do
@@ -138,6 +142,8 @@ with open(dst, 'w', encoding='utf-8', errors='surrogateescape') as f:
     f.writelines(out)
 PY_EOF
 
+  PREV_HEAD=$(git -C "$REPO_ROOT" rev-parse HEAD)
+
   # Apply patch preserving author, date, and commit message
   if ! git -C "$REPO_ROOT" am --3way --committer-date-is-author-date "$PATCH_TMP/patch.clean"; then
     echo "ERROR: Conflict occurred while applying upstream commit $commit ($SUBJECT)"
@@ -145,11 +151,23 @@ PY_EOF
     exit 1
   fi
 
-  echo "$commit" > "$SYNC_FILE"
+  CURR_HEAD=$(git -C "$REPO_ROOT" rev-parse HEAD)
+  if [ "$CURR_HEAD" != "$PREV_HEAD" ]; then
+    APPLIED_COMMITS=$((APPLIED_COMMITS + 1))
+    echo "$commit" > "$SYNC_FILE"
+    git -C "$REPO_ROOT" add "$SYNC_FILE"
+    git -C "$REPO_ROOT" commit --amend --no-edit
+  fi
 done
 
-echo "$HEAD_SYNC" > "$SYNC_FILE"
-echo "Successfully synchronized all $TOTAL upstream commits up to $HEAD_SYNC."
-if [ -n "${GITHUB_OUTPUT:-}" ]; then
-  echo "synced=true" >> "$GITHUB_OUTPUT"
+if [ "$APPLIED_COMMITS" -gt 0 ]; then
+  echo "Successfully synchronized $APPLIED_COMMITS upstream commits."
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "synced=true" >> "$GITHUB_OUTPUT"
+  fi
+else
+  echo "No new upstream commits were applied."
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "synced=false" >> "$GITHUB_OUTPUT"
+  fi
 fi
