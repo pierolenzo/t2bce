@@ -215,7 +215,7 @@ static void t2audio_remove(struct pci_dev *dev)
     cancel_work_sync(&t2audio->resume_work);
     list_for_each_entry(sdev, &t2audio->subdevice_list, list)
         t2audio_pcm_quiesce_subdevice(sdev);
-    t2audio_bce_exit(t2audio);
+    t2audio_bce_stop_messages(t2audio);
     debugfs_remove_recursive(t2audio->debugfs_dir);
     t2audio->debugfs_dir = NULL;
     snd_card_free(t2audio->card);
@@ -225,6 +225,7 @@ static void t2audio_remove(struct pci_dev *dev)
         t2audio_free_dev(sdev);
     }
     destroy_workqueue(t2audio->pcm_io_wq);
+    t2audio_bce_exit(t2audio);
     pci_iounmap(dev, t2audio->reg_mem_bs);
     pci_iounmap(dev, t2audio->reg_mem_cfg);
     device_destroy(t2audio_class, t2audio->devt);

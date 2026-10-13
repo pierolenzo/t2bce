@@ -46,6 +46,7 @@ struct t2audio_send_ctx {
 };
 
 int t2audio_bce_init(struct t2audio_device *dev);
+void t2audio_bce_stop_messages(struct t2audio_device *dev);
 void t2audio_bce_exit(struct t2audio_device *dev);
 int __t2audio_send_prepare(struct t2audio_bce *b, struct t2audio_send_ctx *ctx, char *tag);
 void __t2audio_send(struct t2audio_bce *b, struct t2audio_send_ctx *ctx);

@@ -50,8 +50,7 @@ static void t2audio_bce_flush_queue(struct t2audio_device *dev, struct t2audio_b
         pr_err("t2bce_audio: %s queue flush/completion wait failed (%d)\n", name, status);
 }
 
-/* Unregister the BCE queues: a stale registration makes a later re-probe fail. */
-void t2audio_bce_exit(struct t2audio_device *dev)
+void t2audio_bce_stop_messages(struct t2audio_device *dev)
 {
     struct t2audio_bce *bce = &dev->bcem;
 
@@ -64,8 +63,16 @@ void t2audio_bce_exit(struct t2audio_device *dev)
         destroy_workqueue(dev->msg_wq);
         dev->msg_wq = NULL;
     }
+}
 
-    t2bce_core_synchronize_completions(dev->bce);
+void t2audio_bce_exit(struct t2audio_device *dev)
+{
+    struct t2audio_bce *bce = &dev->bcem;
+
+    if (IS_ERR_OR_NULL(dev->bce))
+        return;
+
+    t2audio_bce_stop_messages(dev);
     t2audio_bce_flush_queue(dev, &bce->qout, "out");
     t2audio_bce_flush_queue(dev, &bce->qin, "in");
     t2bce_core_synchronize_completions(dev->bce);
