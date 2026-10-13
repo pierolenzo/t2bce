@@ -4,6 +4,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
+#include <linux/mm.h>
 
 static u64 t2audio_get_alsa_fmtbit(struct t2audio_apple_description *desc)
 {
@@ -428,7 +429,11 @@ static int t2audio_pcm_mmap(struct snd_pcm_substream *substream, struct vm_area_
     buf = &stream->buffers[0];
     switch (buf->type) {
         case T2AUDIO_DMA_BUF_IOMEM:
-            return snd_pcm_lib_mmap_iomem(substream, area);
+            if (sdev->a->bs_wc)
+                area->vm_page_prot = pgprot_writecombine(area->vm_page_prot);
+            else
+                area->vm_page_prot = pgprot_noncached(area->vm_page_prot);
+            return vm_iomap_memory(area, buf->dma_addr, buf->size);
         case T2AUDIO_DMA_BUF_COHERENT:
             return dma_mmap_coherent(sdev->a->dev, area, buf->ptr, buf->dma_addr, buf->size);
         default:

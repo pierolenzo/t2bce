@@ -104,7 +104,8 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     pr_debug("t2bce_audio: bs len = %llx\n", pci_resource_len(dev, 0));
     t2audio->reg_mem_bs_dma = pci_resource_start(dev, 0);
-    t2audio->reg_mem_bs = pci_iomap(dev, 0, 0);
+    t2audio->bs_wc = pci_resource_flags(dev, 0) & IORESOURCE_PREFETCH;
+    t2audio->reg_mem_bs = t2audio->bs_wc ? pci_iomap_wc(dev, 0, 0) : pci_iomap(dev, 0, 0);
     t2audio->reg_mem_cfg = pci_iomap(dev, 4, 0);
 
     t2audio->reg_mem_gpr = (u32 __iomem *) ((u8 __iomem *) t2audio->reg_mem_cfg + 0xC000);
