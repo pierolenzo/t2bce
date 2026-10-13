@@ -3,11 +3,14 @@
 
 #include "protocol.h"
 #include "t2bce_core_transport.h"
+#include <linux/wait.h>
 
 #define T2AUDIO_BCE_QUEUE_ELEMENT_SIZE 0x1000
 #define T2AUDIO_BCE_QUEUE_ELEMENT_COUNT 20
 
 #define T2AUDIO_BCE_QUEUE_TAG_COUNT 1000
+
+#define T2AUDIO_BCE_DRAIN_TIMEOUT_MS 5000
 
 struct t2audio_device;
 
@@ -28,6 +31,8 @@ struct t2audio_bce {
     struct t2audio_bce_queue qin;
     struct t2audio_bce_queue qout;
     int tag_num;
+    bool teardown;
+    wait_queue_head_t drain_wq;
     struct t2audio_bce_queue_entry *pending_entries[T2AUDIO_BCE_QUEUE_TAG_COUNT];
     struct spinlock spinlock;
 };
@@ -41,6 +46,7 @@ struct t2audio_send_ctx {
 };
 
 int t2audio_bce_init(struct t2audio_device *dev);
+void t2audio_bce_exit(struct t2audio_device *dev);
 int __t2audio_send_prepare(struct t2audio_bce *b, struct t2audio_send_ctx *ctx, char *tag);
 void __t2audio_send(struct t2audio_bce *b, struct t2audio_send_ctx *ctx);
 int __t2audio_send_cmd_sync(struct t2audio_bce *b, struct t2audio_send_ctx *ctx, struct t2audio_msg *reply);

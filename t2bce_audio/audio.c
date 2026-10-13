@@ -90,6 +90,11 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
         status = -ENOMEM;
         goto fail;
     }
+    t2audio->msg_wq = alloc_workqueue("t2bce_audio_msg", 0, 0);
+    if (!t2audio->msg_wq) {
+        status = -ENOMEM;
+        goto fail;
+    }
 
     /* Init: set an unknown flag in the bitset */
     if (pci_read_config_dword(dev, 4, &cfg))
@@ -165,6 +170,7 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
     return 0;
 
 fail_snd:
+    t2audio_bce_exit(t2audio);
     debugfs_remove_recursive(t2audio->debugfs_dir);
     t2audio->debugfs_dir = NULL;
     snd_card_free(t2audio->card);
@@ -178,6 +184,7 @@ fail:
     if (t2audio) {
         if (t2audio->dev)
             device_destroy(t2audio_class, t2audio->devt);
+        t2audio_bce_exit(t2audio);
         if (!IS_ERR_OR_NULL(t2audio->reg_mem_bs))
             pci_iounmap(dev, t2audio->reg_mem_bs);
         if (!IS_ERR_OR_NULL(t2audio->reg_mem_cfg))
@@ -208,6 +215,7 @@ static void t2audio_remove(struct pci_dev *dev)
     cancel_work_sync(&t2audio->resume_work);
     list_for_each_entry(sdev, &t2audio->subdevice_list, list)
         t2audio_pcm_quiesce_subdevice(sdev);
+    t2audio_bce_exit(t2audio);
     debugfs_remove_recursive(t2audio->debugfs_dir);
     t2audio->debugfs_dir = NULL;
     snd_card_free(t2audio->card);
@@ -866,7 +874,7 @@ void t2audio_handle_prop_change(struct t2audio_device *a, struct t2audio_msg *ms
     work->a = a;
     INIT_WORK(&work->ws, t2audio_handle_prop_change_work);
     t2audio_msg_read_property_changed(msg, &work->dev, &work->obj, &work->prop);
-    schedule_work(&work->ws);
+    queue_work(a->msg_wq, &work->ws);
 }
 
 #define t2audio_send_cmd_response(a, sctx, msg, fn, ...) \

@@ -142,6 +142,7 @@ struct t2audio_device {
     struct completion remote_alive;
     struct work_struct resume_work;
     struct workqueue_struct *pcm_io_wq;
+    struct workqueue_struct *msg_wq;
     bool resume_deferred;
     bool pm_quiesced;
 

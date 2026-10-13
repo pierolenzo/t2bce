@@ -2,6 +2,7 @@
 
 #include "audio.h"
 #include <linux/dma-mapping.h>
+#include <linux/err.h>
 #include <linux/ktime.h>
 
 static void t2audio_bce_out_queue_completion(struct t2bce_core_queue_sq *sq);
@@ -17,6 +18,7 @@ int t2audio_bce_init(struct t2audio_device *dev)
     struct t2audio_bce *bce = &dev->bcem;
     bce->cq = t2bce_core_create_cq(dev->bce, 0x80);
     spin_lock_init(&bce->spinlock);
+    init_waitqueue_head(&bce->drain_wq);
     if (!bce->cq)
         return -EINVAL;
     if ((status = t2audio_bce_queue_init(dev, &bce->qout, "com.apple.BridgeAudio.IntelToARM", DMA_TO_DEVICE,
@@ -29,6 +31,64 @@ int t2audio_bce_init(struct t2audio_device *dev)
     }
     t2audio_bce_in_queue_submit_pending(&bce->qin, bce->qin.el_count);
     return 0;
+}
+
+static void t2audio_bce_flush_queue(struct t2audio_device *dev, struct t2audio_bce_queue *q,
+        const char *name)
+{
+    int status;
+
+    if (!q->sq)
+        return;
+    status = t2bce_core_flush_queue(dev->bce, q->sq);
+    if (!status && !wait_event_timeout(dev->bcem.drain_wq,
+            t2bce_core_queue_sq_available(q->sq) ==
+            t2bce_core_queue_sq_capacity(q->sq) - 1,
+            msecs_to_jiffies(T2AUDIO_BCE_DRAIN_TIMEOUT_MS)))
+        status = -ETIMEDOUT;
+    if (status)
+        pr_err("t2bce_audio: %s queue flush/completion wait failed (%d)\n", name, status);
+}
+
+/* Unregister the BCE queues: a stale registration makes a later re-probe fail. */
+void t2audio_bce_exit(struct t2audio_device *dev)
+{
+    struct t2audio_bce *bce = &dev->bcem;
+
+    if (IS_ERR_OR_NULL(dev->bce))
+        return;
+
+    WRITE_ONCE(bce->teardown, true);
+    t2bce_core_synchronize_completions(dev->bce);
+    if (dev->msg_wq) {
+        destroy_workqueue(dev->msg_wq);
+        dev->msg_wq = NULL;
+    }
+
+    t2bce_core_synchronize_completions(dev->bce);
+    t2audio_bce_flush_queue(dev, &bce->qout, "out");
+    t2audio_bce_flush_queue(dev, &bce->qin, "in");
+    t2bce_core_synchronize_completions(dev->bce);
+
+    if (bce->qout.sq)
+        t2bce_core_destroy_sq(dev->bce, bce->qout.sq);
+    if (bce->qin.sq)
+        t2bce_core_destroy_sq(dev->bce, bce->qin.sq);
+    bce->qout.sq = NULL;
+    bce->qin.sq = NULL;
+    t2bce_core_synchronize_completions(dev->bce);
+    if (bce->cq)
+        t2bce_core_destroy_cq(dev->bce, bce->cq);
+    bce->cq = NULL;
+
+    if (bce->qout.data)
+        dma_free_coherent(t2bce_core_client_dma_dev(dev->bce),
+                bce->qout.el_size * bce->qout.el_count, bce->qout.data, bce->qout.dma_addr);
+    if (bce->qin.data)
+        dma_free_coherent(t2bce_core_client_dma_dev(dev->bce),
+                bce->qin.el_size * bce->qin.el_count, bce->qin.data, bce->qin.dma_addr);
+    bce->qout.data = NULL;
+    bce->qin.data = NULL;
 }
 
 int t2audio_bce_queue_init(struct t2audio_device *dev, struct t2audio_bce_queue *q, const char *name,
@@ -45,6 +105,7 @@ int t2audio_bce_queue_init(struct t2audio_device *dev, struct t2audio_bce_queue 
     q->data = dma_alloc_coherent(t2bce_core_client_dma_dev(dev->bce), q->el_size * q->el_count, &q->dma_addr, GFP_KERNEL);
     if (!q->data) {
         t2bce_core_destroy_sq(dev->bce, q->sq);
+        q->sq = NULL;
         return -EINVAL;
     }
     return 0;
@@ -153,9 +214,12 @@ static void t2audio_handle_reply(struct t2audio_bce *b, struct t2audio_msg *repl
 
 static void t2audio_bce_out_queue_completion(struct t2bce_core_queue_sq *sq)
 {
+    struct t2audio_device *dev = t2bce_core_queue_sq_userdata(sq);
+
     while (t2bce_core_next_completion(sq)) {
         t2bce_core_notify_submission_complete(sq);
     }
+    wake_up(&dev->bcem.drain_wq);
 }
 
 static void t2audio_bce_in_queue_handle_msg(struct t2audio_device *a, struct t2audio_msg *msg);
@@ -198,7 +262,9 @@ static void t2audio_bce_in_queue_completion(struct t2bce_core_queue_sq *sq)
         t2bce_core_notify_submission_complete(sq);
         ++cnt;
     }
-    t2audio_bce_in_queue_submit_pending(q, cnt);
+    if (!READ_ONCE(dev->bcem.teardown))
+        t2audio_bce_in_queue_submit_pending(q, cnt);
+    wake_up(&dev->bcem.drain_wq);
 }
 
 static void t2audio_bce_in_queue_handle_msg(struct t2audio_device *a, struct t2audio_msg *msg)
@@ -206,6 +272,8 @@ static void t2audio_bce_in_queue_handle_msg(struct t2audio_device *a, struct t2a
     struct t2audio_msg_header *header = (struct t2audio_msg_header *) msg->data;
     struct t2audio_deferred_msg *work;
 
+    if (READ_ONCE(a->bcem.teardown))
+        return;
     if (msg->size < sizeof(struct t2audio_msg_header)) {
         pr_err("t2bce_audio: Msg size smaller than header (%lx)", msg->size);
         return;
@@ -232,7 +300,7 @@ static void t2audio_bce_in_queue_handle_msg(struct t2audio_device *a, struct t2a
     work->msg.size = msg->size;
     work->msg.received_ns = msg->received_ns;
     INIT_WORK(&work->ws, t2audio_deferred_msg_work);
-    schedule_work(&work->ws);
+    queue_work(a->msg_wq, &work->ws);
 }
 
 void t2audio_bce_in_queue_submit_pending(struct t2audio_bce_queue *q, size_t count)
