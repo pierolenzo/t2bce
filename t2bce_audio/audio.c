@@ -90,7 +90,7 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
         status = -ENOMEM;
         goto fail;
     }
-    t2audio->msg_wq = alloc_workqueue("t2bce_audio_msg", 0, 0);
+    t2audio->msg_wq = alloc_workqueue("t2bce_audio_msg", WQ_PERCPU, 0);
     if (!t2audio->msg_wq) {
         status = -ENOMEM;
         goto fail;
