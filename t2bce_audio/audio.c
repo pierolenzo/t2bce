@@ -269,16 +269,52 @@ static int t2audio_quiesce(struct t2audio_device *t2audio, bool suspend_pcm)
     return status;
 }
 
-static int t2audio_suspend(struct device *dev)
+/*
+ * Quiesce in ->prepare. The prepare phase completes for every device before
+ * any ->suspend runs, so remote access is off before VHCI devices start their
+ * suspend traffic, with or without pm_async. bridgeOS stops answering when
+ * both run concurrently.
+ */
+static int t2audio_prepare(struct device *dev)
 {
     struct t2audio_device *t2audio = pci_get_drvdata(to_pci_dev(dev));
     int status;
 
-    pr_info("t2bce_audio: suspend entry\n");
+    pr_info("t2bce_audio: prepare entry\n");
     status = t2audio_quiesce(t2audio, true);
-    pci_disable_device(t2audio->pci);
-    pr_info("t2bce_audio: suspend exit status=%d\n", status);
+    pr_info("t2bce_audio: prepare exit status=%d\n", status);
     return 0;
+}
+
+static int t2audio_suspend(struct device *dev)
+{
+    struct t2audio_device *t2audio = pci_get_drvdata(to_pci_dev(dev));
+
+    pci_disable_device(t2audio->pci);
+    t2audio->pm_suspended = true;
+    pr_info("t2bce_audio: suspend done quiesced=%d\n", t2audio->pm_quiesced);
+    return 0;
+}
+
+static void t2audio_complete(struct device *dev)
+{
+    struct t2audio_device *t2audio = pci_get_drvdata(to_pci_dev(dev));
+
+    /* ->resume restores a suspended device, an aborted suspend only prepared it. */
+    if (t2audio->pm_suspended) {
+        t2audio->pm_suspended = false;
+        return;
+    }
+    if (!t2audio->pm_quiesced)
+        return;
+
+    if (t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON)) {
+        dev_err(t2audio->dev, "Failed to restore remote access after aborted suspend\n");
+        return;
+    }
+    t2audio->pm_quiesced = false;
+    t2audio_reset_streams(t2audio);
+    pr_info("t2bce_audio: aborted suspend restored\n");
 }
 
 static int t2audio_pm_prepare_client(void *userdata)
@@ -931,8 +967,10 @@ static struct pci_device_id t2audio_ids[  ] = {
 MODULE_DEVICE_TABLE(pci, t2audio_ids);
 
 struct dev_pm_ops t2audio_pci_driver_pm = {
+        .prepare = t2audio_prepare,
         .suspend = t2audio_suspend,
-        .resume = t2audio_resume
+        .resume = t2audio_resume,
+        .complete = t2audio_complete
 };
 struct pci_driver t2audio_pci_driver = {
         .name = "t2bce_audio",

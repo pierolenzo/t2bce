@@ -13,6 +13,7 @@
 
 struct t2bce_device {
     struct pci_dev *pci, *pci0;
+    struct device_link *pci0_link;
     dev_t devt;
     struct device *dev;
     void __iomem *reg_mem_mb;

@@ -177,6 +177,17 @@ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
 #endif
     pci_set_master(bce->pci0);
 
+    /*
+     * Function 0 must stay bus master while bridgeOS saves state on
+     * SAVE_STATE_AND_SLEEP and must be bus master again before
+     * RESTORE_STATE_AND_WAKE. Its driver (nvme) disables the function on
+     * suspend. Order it as our PM supplier so it suspends after and resumes
+     * before this function, also with pm_async.
+     */
+    bce->pci0_link = device_link_add(&dev->dev, &bce->pci0->dev, DL_FLAG_STATELESS);
+    if (!bce->pci0_link)
+        dev_warn(&dev->dev, "t2bce_core: failed to link PM order to function 0\n");
+
     /* bridgeOS expects the XHCI PM doorbell before the controller becomes active. */
     bce_xhci_pm_start(&bce->xhci_pm, true);
 
@@ -197,6 +208,8 @@ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
 fail_ts:
     bce_free_state_buffer(bce);
     bce_xhci_pm_stop(&bce->xhci_pm);
+    if (bce->pci0_link)
+        device_link_del(bce->pci0_link);
 #ifndef WITHOUT_NVME_PATCH
     pci_disable_device(bce->pci0);
 fail_dev0:
@@ -508,6 +521,8 @@ static void t2bce_remove(struct pci_dev *dev)
 
     bce_free_state_buffer(bce);
     bce_xhci_pm_stop(&bce->xhci_pm);
+    if (bce->pci0_link)
+        device_link_del(bce->pci0_link);
 #ifndef WITHOUT_NVME_PATCH
     pci_disable_device(bce->pci0);
 #endif

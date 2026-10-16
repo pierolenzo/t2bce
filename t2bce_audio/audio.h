@@ -146,6 +146,7 @@ struct t2audio_device {
     struct workqueue_struct *msg_wq;
     bool resume_deferred;
     bool pm_quiesced;
+    bool pm_suspended;
 
 };
 
