@@ -234,8 +234,12 @@ static enum hrtimer_restart bce_xhci_pm_tick(struct hrtimer *timer)
     local_irq_save(flags);
     ioread32(regb + 2);
     mb();
-    /* Match macOS mach_absolute_time(), which does not advance in suspend. */
-    host_time = ktime_get();
+    /*
+     * Match macOS mach_absolute_time(), which does not advance in suspend and
+     * is never slewed by NTP. bridgeOS converts audio timestamps into this
+     * clock, so a slewed CLOCK_MONOTONIC moves them away from the DMA clock.
+     */
+    host_time = ktime_get_raw();
     iowrite32((u32) host_time, regb + 2);
     iowrite32((u32) (host_time >> 32), regb);
 

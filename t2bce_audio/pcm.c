@@ -255,7 +255,7 @@ static int t2audio_pcm_start_sync(struct snd_pcm_substream *substream)
 
     t2audio_pcm_reset_timing(stream);
     /* Accept notifications received during START_IO, including sample zero. */
-    stream->timestamp_accept_after = ktime_get();
+    stream->timestamp_accept_after = ktime_get_raw();
 
     /* Publish userspace's prefill before starting the remote consumer. */
     wmb();
@@ -400,11 +400,12 @@ static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream
     /*
      * bridgeOS converts the hardware timestamp with mach_bridge_remote_time(),
      * using the host clock supplied through BCE. It is therefore already in
-     * Linux monotonic nanoseconds. sampleTime advances by bridgeaudiod's fixed
-     * timestampPeriod, so callback spacing must not be used as a sample-rate
-     * estimate: interpolate between anchors at the negotiated stream rate.
+     * Linux CLOCK_MONOTONIC_RAW nanoseconds. sampleTime advances by
+     * bridgeaudiod's fixed timestampPeriod, so callback spacing must not be
+     * used as a sample-rate estimate: interpolate between anchors at the
+     * negotiated stream rate.
      */
-    elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(), stream->remote_timestamp));
+    elapsed_ns = ktime_to_ns(ktime_sub(ktime_get_raw(), stream->remote_timestamp));
     if (elapsed_ns <= 0)
         elapsed_frames = 0;
     else

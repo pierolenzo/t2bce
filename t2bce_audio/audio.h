@@ -11,6 +11,13 @@
 
 #define T2AUDIO_SIG 0x19870423
 
+/*
+ * BridgeAudioControllerPCI writes this GPR word when going to sleep. It only
+ * survives while bridgeOS keeps its remote memory state.
+ */
+#define T2AUDIO_GPR_SLEEP_MARKER 0x10
+#define T2AUDIO_SLEEP_MARKER 0x19770525
+
 #define T2AUDIO_DEVICE_MAX_UID_LEN 128
 #define T2AUDIO_DEVICE_MAX_INPUT_STREAMS 1
 #define T2AUDIO_DEVICE_MAX_OUTPUT_STREAMS 1

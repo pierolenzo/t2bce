@@ -23,6 +23,7 @@ static struct class *t2audio_class;
 
 static int t2audio_init_cmd(struct t2audio_device *a);
 static int t2audio_init_bs(struct t2audio_device *a);
+static int t2audio_reset_buffers(struct t2audio_device *a);
 static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_id);
 static void t2audio_free_dev(struct t2audio_subdevice *sdev);
 static void t2audio_reset_stream(struct t2audio_stream *stream);
@@ -290,6 +291,8 @@ static int t2audio_suspend(struct device *dev)
 {
     struct t2audio_device *t2audio = pci_get_drvdata(to_pci_dev(dev));
 
+    /* BridgeAudioControllerPCI::_setPowerStateGated: Going to sleep */
+    iowrite32(T2AUDIO_SLEEP_MARKER, &t2audio->reg_mem_gpr[T2AUDIO_GPR_SLEEP_MARKER / 4]);
     pci_disable_device(t2audio->pci);
     t2audio->pm_suspended = true;
     pr_info("t2bce_audio: suspend done quiesced=%d\n", t2audio->pm_quiesced);
@@ -364,6 +367,12 @@ static int t2audio_resume(struct device *dev)
         return 0;
     }
 
+    if ((status = t2audio_reset_buffers(t2audio))) {
+        dev_err(t2audio->dev, "Failed to reset buffers\n");
+        pr_info("t2bce_audio: resume exit status=%d path=%s\n", status, path);
+        return status;
+    }
+
     if ((status = t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON))) {
         dev_err(t2audio->dev, "Failed to set remote access\n");
         pr_info("t2bce_audio: resume exit status=%d path=%s\n", status, path);
@@ -384,6 +393,13 @@ static void t2audio_resume_work(struct work_struct *ws)
 
     if (!t2audio->resume_deferred)
         return;
+
+    if (t2audio_reset_buffers(t2audio)) {
+        t2audio->resume_deferred = false;
+        dev_err(t2audio->dev, "Deferred buffer reset failed\n");
+        pr_info("t2bce_audio: resume deferred path failed\n");
+        return;
+    }
 
     if (t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON)) {
         t2audio->resume_deferred = false;
@@ -503,6 +519,13 @@ static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_i
                 sdev->uid, stream_cnt, T2AUDIO_DEVICE_MAX_INPUT_STREAMS);
         stream_cnt = T2AUDIO_DEVICE_MAX_INPUT_STREAMS;
     }
+    /*
+     * macOS registers host input buffers only for Digital Mic and Codec
+     * Input. A Bridge Loopback input buffer is larger than the buffer
+     * bridgeaudiod allocates for its own loopback IO and fails its mapping.
+     */
+    if (!strcmp(sdev->uid, "Bridge Loopback"))
+        stream_cnt = 0;
     sdev->in_stream_cnt = stream_cnt;
     for (i = 0; i < stream_cnt; i++) {
         sdev->in_streams[i].id = stream_list[i];
@@ -614,10 +637,12 @@ static struct t2audio_subdevice *t2audio_find_dev_by_uid(struct t2audio_device *
 
 static void t2audio_init_bs_stream(struct t2audio_device *a, struct t2audio_stream *strm,
         struct t2audio_buffer_struct_stream *bs_strm);
-static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio_stream *strm,
+static void t2audio_remap_bs_stream(struct t2audio_device *a, struct t2audio_stream *strm,
         struct t2audio_buffer_struct_stream *bs_strm);
+static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio_stream *strm);
 
-static int t2audio_init_bs(struct t2audio_device *a)
+/* BridgeAudioPCI::initWithBaseAddresses */
+static int t2audio_map_bs(struct t2audio_device *a, bool remap)
 {
     int i, j;
     struct t2audio_buffer_struct_device *dev;
@@ -642,6 +667,10 @@ static int t2audio_init_bs(struct t2audio_device *a)
     }
     pr_debug("t2bce_audio: BufferStruct ver = %i\n", a->bs->version);
     pr_debug("t2bce_audio: Num devices = %i\n", a->bs->num_devices);
+    if (remap) {
+        list_for_each_entry(sdev, &a->subdevice_list, list)
+            sdev->buf_id = T2AUDIO_BUFFER_ID_NONE;
+    }
     for (i = 0; i < a->bs->num_devices; i++) {
         dev = &a->bs->devices[i];
         pr_debug("t2bce_audio: Device %i %s\n", i, dev->name);
@@ -653,11 +682,14 @@ static int t2audio_init_bs(struct t2audio_device *a)
         }
         strscpy(dev->name, sdev->uid, sizeof(dev->name));
         sdev->buf_id = (u8) i;
-        dev->num_input_streams = 0;
         for (j = 0; j < dev->num_output_streams; j++) {
             pr_debug("t2bce_audio: Device %i Stream %i: Output; Buffer Count = %i\n", i, j,
                      dev->output_streams[j].num_buffers);
-            if (j < sdev->out_stream_cnt)
+            if (j >= sdev->out_stream_cnt)
+                continue;
+            if (remap)
+                t2audio_remap_bs_stream(a, &sdev->out_streams[j], &dev->output_streams[j]);
+            else
                 t2audio_init_bs_stream(a, &sdev->out_streams[j], &dev->output_streams[j]);
         }
     }
@@ -672,19 +704,93 @@ static int t2audio_init_bs(struct t2audio_device *a)
         a->bs->devices[i].num_output_streams = 0;
         a->bs->num_devices = ++i;
     }
-    list_for_each_entry(sdev, &a->subdevice_list, list) {
-        if (sdev->in_stream_cnt == 1) {
-            pr_debug("t2bce_audio: Device %i Host Stream; Input\n", sdev->buf_id);
-            t2audio_init_bs_stream_host(a, &sdev->in_streams[0], &a->bs->devices[sdev->buf_id].input_streams[0]);
-            a->bs->devices[sdev->buf_id].num_input_streams = 1;
-            wmb();
 
-            if (t2audio_cmd_set_input_stream_address_ranges(a, sdev->dev_id)) {
-                dev_err(a->dev, "t2bce_audio: Failed to set input stream address ranges\n");
-            }
-        }
+    return 0;
+}
+
+/* BridgeAudioPCI::setInputBufferInfoForDeviceAtIndex(i, 0, 0) for every device */
+static void t2audio_reset_input_streams(struct t2audio_device *a)
+{
+    struct t2audio_buffer_struct_device *dev;
+    int i;
+
+    for (i = 0; i < a->bs->num_devices && i < ARRAY_SIZE(a->bs->devices); i++) {
+        dev = &a->bs->devices[i];
+        dev->input_streams[0].buffers[0].address = 0;
+        dev->input_streams[0].buffers[0].size = 0;
+        dev->input_streams[0].num_buffers = 0;
+        dev->num_input_streams = 0;
     }
+    wmb();
+}
 
+/* BridgeAudioControllerPCI::_registerInputStreamGated with the host buffer */
+static void t2audio_register_input_stream(struct t2audio_device *a, struct t2audio_subdevice *sdev)
+{
+    struct t2audio_buffer_struct_device *dev = &a->bs->devices[sdev->buf_id];
+    struct t2audio_stream *strm = &sdev->in_streams[0];
+
+    if (!strm->buffer_cnt)
+        return;
+    pr_debug("t2bce_audio: Device %i Host Stream; Input size %zx\n", sdev->buf_id,
+             strm->buffers[0].size);
+    dev->input_streams[0].buffers[0].address = strm->buffers[0].dma_addr;
+    dev->input_streams[0].buffers[0].size = strm->buffers[0].size;
+    dev->input_streams[0].num_buffers = 1;
+    dev->num_input_streams = 1;
+    wmb();
+
+    if (t2audio_cmd_set_input_stream_address_ranges(a, sdev->dev_id))
+        dev_err(a->dev, "t2bce_audio: Failed to set input stream address ranges\n");
+}
+
+static void t2audio_register_input_streams(struct t2audio_device *a)
+{
+    struct t2audio_subdevice *sdev;
+
+    list_for_each_entry(sdev, &a->subdevice_list, list) {
+        if (sdev->in_stream_cnt == 1)
+            t2audio_register_input_stream(a, sdev);
+    }
+}
+
+static int t2audio_init_bs(struct t2audio_device *a)
+{
+    struct t2audio_subdevice *sdev;
+    int status;
+
+    status = t2audio_map_bs(a, false);
+    if (status)
+        return status;
+    list_for_each_entry(sdev, &a->subdevice_list, list) {
+        if (sdev->in_stream_cnt == 1)
+            t2audio_init_bs_stream_host(a, &sdev->in_streams[0]);
+    }
+    t2audio_reset_input_streams(a);
+    t2audio_register_input_streams(a);
+    return 0;
+}
+
+/*
+ * BridgeAudioControllerPCI::_resetBuffersGated, which coreaudiod runs after
+ * wake. Without the sleep marker bridgeOS lost power and the BufferStruct is
+ * mapped again. Either way every input entry is cleared and the host input
+ * buffers are registered again before remote access returns.
+ */
+static int t2audio_reset_buffers(struct t2audio_device *a)
+{
+    int status;
+
+    if (ioread32(&a->reg_mem_gpr[T2AUDIO_GPR_SLEEP_MARKER / 4]) != T2AUDIO_SLEEP_MARKER) {
+        pr_info("t2bce_audio: bridge power failure detected, remapping remote memory\n");
+        status = t2audio_map_bs(a, true);
+        if (status)
+            return status;
+    } else {
+        pr_info("t2bce_audio: bridge kept remote memory, resetting input buffers\n");
+    }
+    t2audio_reset_input_streams(a);
+    t2audio_register_input_streams(a);
     return 0;
 }
 
@@ -787,8 +893,32 @@ static void t2audio_init_bs_stream(struct t2audio_device *a, struct t2audio_stre
     }
 }
 
-static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio_stream *strm,
-        struct t2audio_buffer_struct_stream *bs_strm)
+/* Bridge lost power: point the existing output buffers at the new BufferStruct */
+static void t2audio_remap_bs_stream(struct t2audio_device *a, struct t2audio_stream *strm,
+                                   struct t2audio_buffer_struct_stream *bs_strm)
+{
+    size_t i;
+
+    if (!strm->buffers) {
+        t2audio_init_bs_stream(a, strm, bs_strm);
+        return;
+    }
+    if (min_t(size_t, bs_strm->num_buffers, T2AUDIO_DEVICE_MAX_BUFFER_COUNT) != strm->buffer_cnt) {
+        dev_err(a->dev, "BufferStruct buffer count changed to %u\n", bs_strm->num_buffers);
+        return;
+    }
+    for (i = 0; i < strm->buffer_cnt; i++) {
+        if (bs_strm->buffers[i].size != strm->buffers[i].size) {
+            dev_err(a->dev, "BufferStruct buffer size changed from %zx to %zx\n",
+                    strm->buffers[i].size, bs_strm->buffers[i].size);
+            continue;
+        }
+        strm->buffers[i].dma_addr = a->reg_mem_bs_dma + (dma_addr_t) bs_strm->buffers[i].address;
+        strm->buffers[i].ptr = a->reg_mem_bs + bs_strm->buffers[i].address;
+    }
+}
+
+static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio_stream *strm)
 {
     size_t size;
     dma_addr_t dma_addr;
@@ -799,9 +929,6 @@ static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio
         dev_err(a->dev, "dma_alloc_coherent failed\n");
         return;
     }
-    bs_strm->buffers[0].address = dma_addr;
-    bs_strm->buffers[0].size = size;
-    bs_strm->num_buffers = 1;
 
     memset(dma_ptr, 0, size);
 
@@ -810,9 +937,6 @@ static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio
     if (!strm->buffers) {
         dev_err(a->dev, "Buffer list allocation failed\n");
         dma_free_coherent(&a->pci->dev, size, dma_ptr, dma_addr);
-        bs_strm->buffers[0].address = 0;
-        bs_strm->buffers[0].size = 0;
-        bs_strm->num_buffers = 0;
         strm->buffer_cnt = 0;
         return;
     }

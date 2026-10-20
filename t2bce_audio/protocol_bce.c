@@ -257,7 +257,7 @@ static void t2audio_bce_in_queue_completion(struct t2bce_core_queue_sq *sq)
     while ((c = t2bce_core_next_completion(sq))) {
         msg.data = (u8 *) q->data + q->data_head * q->el_size;
         msg.size = c->data_size;
-        msg.received_ns = ktime_get_ns();
+        msg.received_ns = ktime_get_raw_ns();
 #ifdef DEBUG
         pr_debug("t2bce_audio: Received command data %llx\n", c->data_size);
         print_hex_dump(KERN_DEBUG, "t2bce_audio:IN ", DUMP_PREFIX_NONE, 32, 1, msg.data, min(msg.size, 128UL), true);
