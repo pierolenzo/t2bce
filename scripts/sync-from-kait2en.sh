@@ -144,6 +144,9 @@ PY_EOF
 
   PREV_HEAD=$(git -C "$REPO_ROOT" rev-parse HEAD)
 
+  # Fetch commit objects from upstream into local repo so --3way has all ancestor blobs
+  git -C "$REPO_ROOT" fetch --no-tags "$UPSTREAM_DIR" "$commit" >/dev/null 2>&1 || true
+
   # Apply patch preserving author, date, and commit message
   if ! git -C "$REPO_ROOT" am --3way --committer-date-is-author-date "$PATCH_TMP/patch.clean"; then
     echo "ERROR: Conflict occurred while applying upstream commit $commit ($SUBJECT)"
