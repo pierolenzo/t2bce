@@ -1062,8 +1062,8 @@ void t2audio_handle_cmd_timestamp(struct t2audio_device *a, struct t2audio_msg *
             devid, timestamp, msg->received_ns, update_seed, sample_frames);
     sdev = t2audio_find_dev_by_dev_id(a, devid);
     if (sdev)
-        t2audio_handle_timestamp(sdev, timestamp, update_seed,
-                sample_frames);
+        t2audio_handle_timestamp(sdev, msg->received_ns, timestamp,
+                update_seed, sample_frames);
 reply:
     t2audio_send_cmd_response(a, &sctx, msg,
             t2audio_msg_write_update_timestamp_response);

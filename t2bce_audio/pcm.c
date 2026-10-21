@@ -151,13 +151,16 @@ void t2audio_pcm_quiesce_stream(struct t2audio_stream *stream)
 void t2audio_pcm_reset_timing(struct t2audio_stream *stream)
 {
     stream->waiting_for_first_ts = true;
-    stream->remote_timestamp = 0;
-    stream->timestamp_accept_after = 0;
-    stream->last_device_timestamp = 0;
-    stream->last_sample_frames = 0;
+    stream->accept_after_ns = 0;
+    stream->last_received_ns = 0;
+    stream->anchor_ns = 0;
     stream->sample_frames = 0;
     stream->reported_frames = 0;
+    stream->sample_period = 0;
     stream->timeline_fault = false;
+    memset(stream->write_history, 0, sizeof(stream->write_history));
+    stream->write_history_idx = 0;
+    stream->reset_zeroing = false;
 }
 
 static int t2audio_pcm_open(struct snd_pcm_substream *substream)
@@ -253,9 +256,13 @@ static int t2audio_pcm_start_sync(struct snd_pcm_substream *substream)
     if (!substream->runtime->buffer_size || !t2audio_pcm_dma_buf(stream))
         return -EINVAL;
 
+    /* BASPDevice performStartIO clears its timestamp ring before START_IO. */
     t2audio_pcm_reset_timing(stream);
-    /* Accept notifications received during START_IO, including sample zero. */
-    stream->timestamp_accept_after = ktime_get_raw();
+    /*
+     * Notifications received during START_IO, including sample zero, belong
+     * to this run. Both sides of the comparison are local receive times.
+     */
+    stream->accept_after_ns = ktime_get_raw_ns();
 
     /* Publish userspace's prefill before starting the remote consumer. */
     wmb();
@@ -285,9 +292,8 @@ static int t2audio_pcm_stop_sync(struct snd_pcm_substream *substream)
 
     t2audio_pcm_quiesce_stream(stream);
     status = t2audio_cmd_stop_io(sdev->a, sdev->dev_id);
-    stream->remote_timestamp = 0;
     stream->waiting_for_first_ts = true;
-    stream->timestamp_accept_after = 0;
+    stream->accept_after_ns = 0;
     return status;
 }
 
@@ -384,10 +390,10 @@ static void t2audio_pcm_init_stream_work(struct t2audio_subdevice *sdev,
 static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream)
 {
     struct t2audio_stream *stream = t2audio_pcm_stream(substream);
-    s64 elapsed_ns;
-    u64 elapsed_frames;
     u64 latency = substream->stream == SNDRV_PCM_STREAM_CAPTURE ?
             stream->latency : 0;
+    u64 elapsed_frames, period;
+    s64 elapsed_ns;
 
     if (!smp_load_acquire(&stream->started))
         return 0;
@@ -398,21 +404,22 @@ static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream
         return 0;
 
     /*
-     * bridgeOS converts the hardware timestamp with mach_bridge_remote_time(),
-     * using the host clock supplied through BCE. It is therefore already in
-     * Linux CLOCK_MONOTONIC_RAW nanoseconds. sampleTime advances by
-     * bridgeaudiod's fixed timestampPeriod, so callback spacing must not be
-     * used as a sample-rate estimate: interpolate between anchors at the
-     * negotiated stream rate.
+     * BASPDevice's GetZeroTimestampBlock returns the last received
+     * (sampleTime, hostTime) unchanged and the HAL models the clock between
+     * those zero timestamps. bridgeaudiod sends one per ring pass, so the
+     * driver takes the HAL's part: start at sampleTime and advance at the
+     * stream rate from hostTime, but stay below the next zero timestamp.
      */
-    elapsed_ns = ktime_to_ns(ktime_sub(ktime_get_raw(), stream->remote_timestamp));
-    if (elapsed_ns <= 0)
-        elapsed_frames = 0;
-    else
-        elapsed_frames = mul_u64_u32_div(elapsed_ns,
-                substream->runtime->rate, NSEC_PER_SEC);
-    stream->reported_frames = t2audio_position_frames(stream->sample_frames,
-            elapsed_frames, latency, stream->reported_frames);
+    elapsed_ns = (s64) (ktime_get_raw_ns() - stream->anchor_ns);
+    elapsed_frames = elapsed_ns > 0 ? mul_u64_u32_div(elapsed_ns,
+            substream->runtime->rate, NSEC_PER_SEC) : 0;
+    period = stream->sample_period ? stream->sample_period :
+            substream->runtime->buffer_size;
+    elapsed_frames = min(elapsed_frames, period - 1);
+    stream->reported_frames = max(stream->reported_frames,
+            t2audio_position_frames(stream->sample_frames + elapsed_frames,
+                                    latency));
+
     substream->runtime->delay = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
             stream->latency : 0;
     return stream->reported_frames % substream->runtime->buffer_size;
@@ -537,69 +544,109 @@ void t2audio_pcm_cleanup_subdevice(struct t2audio_subdevice *sdev)
         cancel_work_sync(&sdev->in_streams[0].io_work);
 }
 
+/*
+ * BASPDevice updateTimestamp block: when the client's write count did not
+ * advance across two timestamps, zero the output ring once so bridgeOS plays
+ * silence instead of looping stale samples. Zeroing is armed again once the
+ * client writes past the recorded history. appl_ptr stands in for writeMixCount.
+ */
+static void t2audio_pcm_check_stalled_writer(struct snd_pcm_substream *substream,
+        struct t2audio_stream *stream)
+{
+    snd_pcm_uframes_t written = READ_ONCE(substream->runtime->control->appl_ptr);
+    snd_pcm_uframes_t *history = stream->write_history;
+    struct t2audio_dma_buf *buf = t2audio_pcm_dma_buf(stream);
+
+    history[stream->write_history_idx] = written;
+    if (!buf || !history[0] || history[0] != history[1] || stream->reset_zeroing) {
+        if (written > history[0] || written > history[1])
+            stream->reset_zeroing = false;
+        stream->write_history_idx = !stream->write_history_idx;
+        return;
+    }
+
+    pr_debug("t2bce_audio: zeroing stalled output ring dev=%s written=%lu\n",
+            stream->sdev->uid, written);
+    t2audio_dma_memset(buf, 0, 0, buf->size);
+    stream->reset_zeroing = true;
+    stream->write_history_idx = 0;
+}
+
+/* BASPDevice updateTimestamp:andUpdateSeed:andSampleTime: */
 static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream,
-        u64 device_timestamp, u64 update_seed, u64 sample_frames)
+        u64 received_ns, u64 device_timestamp, u64 update_seed, u64 sample_frames)
 {
     unsigned long flags;
     struct t2audio_stream *stream = t2audio_pcm_stream(substream);
     struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
-    u64 anchor_frames = sample_frames;
-    u64 elapsed_frames;
-    u64 elapsed_ns;
+    u64 expected, window_ns;
 
     snd_pcm_stream_lock_irqsave(substream, flags);
     if (!smp_load_acquire(&stream->started) || !substream->runtime ||
-            device_timestamp < ktime_to_ns(stream->timestamp_accept_after))
-        goto out;
-
-    /* Deferred work can run out of order. Never apply an older anchor. */
-    if (!stream->waiting_for_first_ts &&
-            device_timestamp <= stream->last_device_timestamp)
+            received_ns < stream->accept_after_ns)
         goto out;
 
     /*
-     * bridgeaudiod sends seed=1 with sampleTime=0 at a reset, seed=0 for
-     * continuation. A running timeline cannot silently change ring origin.
+     * Deferred work can run out of order. The BCE completion order is the
+     * order bridgeaudiod sent the notifications in, so never apply a
+     * notification received before the one already applied.
      */
-    if ((update_seed && sample_frames) ||
-            (!stream->waiting_for_first_ts &&
-             ((update_seed && (stream->reported_frames || stream->sample_frames)) ||
-              sample_frames < stream->last_sample_frames ||
-              device_timestamp < stream->last_device_timestamp))) {
-        stream->timeline_fault = true;
-        pr_warn_ratelimited("t2bce_audio: timeline reset dev=%s sample=%llu previous=%llu seed=%llu\n",
-                sdev->uid, sample_frames, stream->last_sample_frames, update_seed);
-        snd_pcm_period_elapsed_under_stream_lock(substream);
+    if (!stream->waiting_for_first_ts &&
+            received_ns <= stream->last_received_ns)
         goto out;
+
+    if (!stream->waiting_for_first_ts) {
+        /*
+         * bridgeaudiod sends seed=1 with sampleTime=0 at a reset. BASPDevice
+         * bumps the HAL seed so the HAL starts a new timeline. ALSA cannot
+         * move a running ring origin, so report an XRUN instead.
+         */
+        if ((update_seed && stream->sample_frames) ||
+                sample_frames < stream->sample_frames) {
+            stream->timeline_fault = true;
+            pr_warn_ratelimited("t2bce_audio: timeline reset dev=%s sample=%llu previous=%llu seed=%llu\n",
+                    sdev->uid, sample_frames, stream->sample_frames, update_seed);
+            snd_pcm_period_elapsed_under_stream_lock(substream);
+            goto out;
+        }
+        /*
+         * BASPDevice expects sampleTime to advance by exactly one
+         * timestampPeriod and only logs a mismatch. The period is not
+         * queried here, so the first observed step stands in for it.
+         */
+        if (!stream->sample_period)
+            stream->sample_period = sample_frames - stream->sample_frames;
+        expected = stream->sample_frames + stream->sample_period;
+        if (sample_frames != expected)
+            pr_debug_ratelimited("t2bce_audio: sampleTime step dev=%s sample=%llu expected=%llu\n",
+                    sdev->uid, sample_frames, expected);
     }
 
     /*
-     * bridgeaudiod increments sampleTime by one fixed timestampPeriod per
-     * callback. A delayed or missed callback therefore leaves sampleTime
-     * behind the continuously running DMA clock. Do not replace the current
-     * interpolation anchor with that older position: doing so freezes the
-     * monotonic ALSA pointer until sampleTime catches up and triggers XRUN
-     * recovery. Carry forward the frames elapsed from the previous hardware
-     * timestamp instead. A genuine reset is handled above and START_IO clears
-     * the timing state before the first new anchor.
+     * hostTime normally trails the local receive time by 1-3 ms. Until
+     * bridgeOS has recalibrated after a wake it can be off by far more, so
+     * an anchor outside one ring pass of the receive time uses the receive
+     * time instead.
      */
-    if (!stream->waiting_for_first_ts &&
-            device_timestamp > stream->last_device_timestamp) {
-        elapsed_ns = device_timestamp - stream->last_device_timestamp;
-        elapsed_frames = mul_u64_u32_div(elapsed_ns,
-                substream->runtime->rate, NSEC_PER_SEC);
-        anchor_frames = t2audio_reanchor_frames(anchor_frames,
-                stream->sample_frames, elapsed_frames);
+    window_ns = mul_u64_u32_div(substream->runtime->buffer_size, NSEC_PER_SEC,
+            substream->runtime->rate);
+    if (device_timestamp > received_ns ||
+            received_ns - device_timestamp > window_ns) {
+        pr_warn_ratelimited("t2bce_audio: implausible hostTime dev=%s t2=%llu host=%llu\n",
+                sdev->uid, device_timestamp, received_ns);
+        stream->anchor_ns = received_ns;
+    } else {
+        stream->anchor_ns = device_timestamp;
     }
-
-    stream->last_sample_frames = sample_frames;
-    stream->sample_frames = anchor_frames;
-    stream->last_device_timestamp = device_timestamp;
-    stream->remote_timestamp = ns_to_ktime(device_timestamp);
+    stream->sample_frames = sample_frames;
+    stream->last_received_ns = received_ns;
     stream->waiting_for_first_ts = false;
-    pr_debug("t2bce_audio: anchor dev=%s direction=%d sample=%llu reported=%llu host=%llu seed=%llu\n",
-            sdev->uid, substream->stream, anchor_frames, stream->reported_frames,
-            device_timestamp, update_seed);
+    pr_debug("t2bce_audio: anchor dev=%s direction=%d sample=%llu t2=%llu host=%llu seed=%llu\n",
+            sdev->uid, substream->stream, sample_frames, device_timestamp,
+            received_ns, update_seed);
+
+    if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+        t2audio_pcm_check_stalled_writer(substream, stream);
 
     if (!substream->runtime->no_period_wakeup)
         snd_pcm_period_elapsed_under_stream_lock(substream);
@@ -607,7 +654,7 @@ out:
     snd_pcm_stream_unlock_irqrestore(substream, flags);
 }
 
-void t2audio_handle_timestamp(struct t2audio_subdevice *sdev,
+void t2audio_handle_timestamp(struct t2audio_subdevice *sdev, u64 received_ns,
         u64 device_timestamp, u64 update_seed, u64 sample_frames)
 {
     struct snd_pcm_substream *substream;
@@ -616,10 +663,10 @@ void t2audio_handle_timestamp(struct t2audio_subdevice *sdev,
         return;
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
     if (substream)
-        t2audio_handle_stream_timestamp(substream, device_timestamp,
-                update_seed, sample_frames);
+        t2audio_handle_stream_timestamp(substream, received_ns,
+                device_timestamp, update_seed, sample_frames);
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
     if (substream)
-        t2audio_handle_stream_timestamp(substream, device_timestamp,
-                update_seed, sample_frames);
+        t2audio_handle_stream_timestamp(substream, received_ns,
+                device_timestamp, update_seed, sample_frames);
 }

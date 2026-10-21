@@ -36,23 +36,13 @@ static inline bool t2audio_decode_sample_time(u64 bits, u64 *frames)
     return true;
 }
 
-/* Clamp before wrapping: a small correction must not look like a full ring. */
-static inline u64 t2audio_position_frames(u64 sample, u64 elapsed_frames,
-        u64 latency, u64 previous)
+/*
+ * BASPDevice hands the last (sampleTime, hostTime) pair to the HAL unchanged.
+ * Capture additionally holds back the device input latency.
+ */
+static inline u64 t2audio_position_frames(u64 sample, u64 latency)
 {
-    u64 frames = sample + elapsed_frames;
-
-    frames = frames > latency ? frames - latency : 0;
-    return frames > previous ? frames : previous;
-}
-
-/* Preserve continuous DMA progress when callback-counted sampleTime lags. */
-static inline u64 t2audio_reanchor_frames(u64 sample, u64 previous_anchor,
-        u64 elapsed_frames)
-{
-    u64 projected = previous_anchor + elapsed_frames;
-
-    return sample > projected ? sample : projected;
+    return sample > latency ? sample - latency : 0;
 }
 
 #endif
