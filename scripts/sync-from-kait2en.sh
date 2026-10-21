@@ -142,12 +142,16 @@ with open(dst, 'w', encoding='utf-8', errors='surrogateescape') as f:
     f.writelines(out)
 PY_EOF
 
+  # Ensure source commit objects are available in the local object database.
+  # git am --3way needs these blobs to build fake ancestors.
+  if ! git -C "$REPO_ROOT" cat-file -e "$commit^{commit}" 2>/dev/null; then
+    git -C "$REPO_ROOT" fetch --no-tags --depth=1 "$UPSTREAM_URL" "$commit"
+  fi
+
   PREV_HEAD=$(git -C "$REPO_ROOT" rev-parse HEAD)
 
   # Apply patch preserving author, date, and commit message.
-  # Point git am at upstream objects so --3way can build fake ancestors.
-  if ! GIT_ALTERNATE_OBJECT_DIRECTORIES="$UPSTREAM_DIR/.git/objects" \
-    git -C "$REPO_ROOT" am --3way --committer-date-is-author-date "$PATCH_TMP/patch.clean"; then
+  if ! git -C "$REPO_ROOT" am --3way --committer-date-is-author-date "$PATCH_TMP/patch.clean"; then
     echo "ERROR: Conflict occurred while applying upstream commit $commit ($SUBJECT)"
     echo "Resolve conflict and run 'git am --resolved', or abort with 'git am --abort'."
     exit 1
