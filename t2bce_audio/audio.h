@@ -91,6 +91,7 @@ struct t2audio_stream {
     u64 last_received_ns;
     u64 anchor_ns;
     u64 sample_frames;
+    u64 sample_base;
     u64 reported_frames;
     u64 sample_period;
     bool timeline_fault;

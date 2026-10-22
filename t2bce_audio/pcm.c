@@ -155,6 +155,7 @@ void t2audio_pcm_reset_timing(struct t2audio_stream *stream)
     stream->last_received_ns = 0;
     stream->anchor_ns = 0;
     stream->sample_frames = 0;
+    stream->sample_base = 0;
     stream->reported_frames = 0;
     stream->sample_period = 0;
     stream->timeline_fault = false;
@@ -259,10 +260,17 @@ static int t2audio_pcm_start_sync(struct snd_pcm_substream *substream)
     /* BASPDevice performStartIO clears its timestamp ring before START_IO. */
     t2audio_pcm_reset_timing(stream);
     /*
-     * Notifications received during START_IO, including sample zero, belong
-     * to this run. Both sides of the comparison are local receive times.
+     * Zero timestamps anchored after this point belong to this run,
+     * including those sent during START_IO.
      */
     stream->accept_after_ns = ktime_get_raw_ns();
+    /*
+     * bridgeaudiod sends the first zero timestamp only after the device has
+     * already been reading for some 30 ms. Until it arrives, playback counts
+     * from before START_IO. The device cannot read earlier, so this never
+     * reports less than it consumed.
+     */
+    stream->anchor_ns = stream->accept_after_ns;
 
     /* Publish userspace's prefill before starting the remote consumer. */
     wmb();
@@ -400,7 +408,8 @@ static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream
 
     if (stream->timeline_fault)
         return SNDRV_PCM_POS_XRUN;
-    if (stream->waiting_for_first_ts)
+    if (stream->waiting_for_first_ts &&
+            substream->stream == SNDRV_PCM_STREAM_CAPTURE)
         return 0;
 
     /*
@@ -417,7 +426,8 @@ static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream
             substream->runtime->buffer_size;
     elapsed_frames = min(elapsed_frames, period - 1);
     stream->reported_frames = max(stream->reported_frames,
-            t2audio_position_frames(stream->sample_frames + elapsed_frames,
+            t2audio_position_frames(stream->sample_frames -
+                                    stream->sample_base + elapsed_frames,
                                     latency));
 
     substream->runtime->delay = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
@@ -580,11 +590,33 @@ static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream,
     struct t2audio_stream *stream = t2audio_pcm_stream(substream);
     struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
     u64 expected, window_ns;
+    bool plausible;
 
     snd_pcm_stream_lock_irqsave(substream, flags);
-    if (!smp_load_acquire(&stream->started) || !substream->runtime ||
-            received_ns < stream->accept_after_ns)
+    if (!smp_load_acquire(&stream->started) || !substream->runtime)
         goto out;
+
+    /*
+     * hostTime normally trails the local receive time by 1-3 ms. Until
+     * bridgeOS has recalibrated after a wake it can be off by far more, so
+     * an anchor outside one ring pass of the receive time uses the receive
+     * time instead.
+     */
+    window_ns = mul_u64_u32_div(substream->runtime->buffer_size, NSEC_PER_SEC,
+            substream->runtime->rate);
+    plausible = device_timestamp <= received_ns &&
+            received_ns - device_timestamp <= window_ns;
+
+    /*
+     * A restart after a pause longer than one ring pass can deliver the
+     * previous run's next zero timestamp during START_IO. No zero timestamp
+     * of this run can carry a hostTime from before START_IO was sent.
+     */
+    if (device_timestamp < stream->accept_after_ns) {
+        pr_debug("t2bce_audio: stale timestamp dev=%s sample=%llu t2=%llu host=%llu\n",
+                sdev->uid, sample_frames, device_timestamp, received_ns);
+        goto out;
+    }
 
     /*
      * Deferred work can run out of order. The BCE completion order is the
@@ -622,22 +654,17 @@ static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream,
                     sdev->uid, sample_frames, expected);
     }
 
-    /*
-     * hostTime normally trails the local receive time by 1-3 ms. Until
-     * bridgeOS has recalibrated after a wake it can be off by far more, so
-     * an anchor outside one ring pass of the receive time uses the receive
-     * time instead.
-     */
-    window_ns = mul_u64_u32_div(substream->runtime->buffer_size, NSEC_PER_SEC,
-            substream->runtime->rate);
-    if (device_timestamp > received_ns ||
-            received_ns - device_timestamp > window_ns) {
+    if (!plausible)
         pr_warn_ratelimited("t2bce_audio: implausible hostTime dev=%s t2=%llu host=%llu\n",
                 sdev->uid, device_timestamp, received_ns);
-        stream->anchor_ns = received_ns;
-    } else {
-        stream->anchor_ns = device_timestamp;
-    }
+    stream->anchor_ns = plausible ? device_timestamp : received_ns;
+    /*
+     * The ring origin is the ring pass of the first zero timestamp, so the
+     * position counted before it carries on without wrapping back.
+     */
+    if (stream->waiting_for_first_ts)
+        stream->sample_base = sample_frames -
+                sample_frames % substream->runtime->buffer_size;
     stream->sample_frames = sample_frames;
     stream->last_received_ns = received_ns;
     stream->waiting_for_first_ts = false;
