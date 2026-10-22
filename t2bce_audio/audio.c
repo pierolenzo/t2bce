@@ -509,6 +509,16 @@ static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_i
     if (t2audio_cmd_get_primitive_property(a, dev_id, dev_id,
             T2AUDIO_PROP(T2AUDIO_PROP_SCOPE_OUTPUT, T2AUDIO_PROP_LATENCY, 0), NULL, 0, &sdev->out_latency, sizeof(u32)))
         dev_warn(a->dev, "Failed to query device output latency\n");
+    /* BASPDevice copies both safety offsets from the remote device. */
+    if (t2audio_cmd_get_primitive_property(a, dev_id, dev_id,
+            T2AUDIO_PROP(T2AUDIO_PROP_SCOPE_INPUT, T2AUDIO_PROP_SAFETY_OFFSET, 0), NULL, 0, &sdev->in_safety_offset, sizeof(u32)))
+        dev_warn(a->dev, "Failed to query device input safety offset\n");
+    if (t2audio_cmd_get_primitive_property(a, dev_id, dev_id,
+            T2AUDIO_PROP(T2AUDIO_PROP_SCOPE_OUTPUT, T2AUDIO_PROP_SAFETY_OFFSET, 0), NULL, 0, &sdev->out_safety_offset, sizeof(u32)))
+        dev_warn(a->dev, "Failed to query device output safety offset\n");
+    dev_info(a->dev, "%s: latency in=%u out=%u safety offset in=%u out=%u\n",
+            sdev->uid, sdev->in_latency, sdev->out_latency,
+            sdev->in_safety_offset, sdev->out_safety_offset);
 
     if (t2audio_cmd_get_input_stream_list(a, &buf, dev_id, &stream_list, &stream_cnt)) {
         dev_err(a->dev, "Failed to get input stream list for device %llx\n", dev_id);

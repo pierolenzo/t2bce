@@ -84,6 +84,7 @@ enum {
     T2AUDIO_PROP_JACK_PLUGGED = 0x6a61636b, // 'jack'
     T2AUDIO_PROP_SEL_VOLUME   = 0x64656176, // 'deav'
     T2AUDIO_PROP_LATENCY      = 0x6c746e63, // 'ltnc'
+    T2AUDIO_PROP_SAFETY_OFFSET = 0x73616674, // 'saft'
     T2AUDIO_PROP_PHYS_FORMAT  = 0x70667420  // 'pft '
 };
 
