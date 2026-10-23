@@ -369,7 +369,10 @@ static int bce_vhci_hub_status_data(struct usb_hcd *hcd, char *buf)
     memset(buf, 0, 2);
     buf[0] = (char)((pending << 1) & 0xff);
     buf[1] = (char)((pending >> 7) & 0xff);
-    return buf[0] || buf[1];
+    /* Bitmap length in bytes, ports 8 and up live in buf[1] */
+    if (!buf[0] && !buf[1])
+        return 0;
+    return vhci->port_count >= 8 ? 2 : 1;
 }
 
 static int bce_vhci_reset_device(struct bce_vhci *vhci, int index, u16 timeout);
