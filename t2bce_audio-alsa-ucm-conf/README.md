@@ -1,4 +1,4 @@
-# Apple T2 ALSA UCM Profile
+# t2bce_audio-alsa-ucm-conf
 
 This directory contains the ALSA UCM profile for `modules/t2bce_audio`.
 

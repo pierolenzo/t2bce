@@ -13,7 +13,7 @@ These kernel parameters have to be set in Linux commandline:
 - `mem_sleep_default=deep` This is S3. S2 and 4 should also work
 
 
-# Workarounds
+## Workarounds
 
 A fixed t2bce doesn't fix suspend. While it was broken for many years, developers of other T2 patches/drivers did not take care of implementing suspend/resume methods because suspend was broken by t2bce anyways. Also Apple never cared for Linux (on some Macbooks ACPI tables have real issues). And finally we have the T2 and Apple-modified hardware/platform to deal with. Not all hope is lost though. We can work around most of it using systemd units.
 The below units will help you around the roughest cliffs. Note that you can combine them into one unit. Also note the minus sign in for example `ExecStart=-/usr/bin...` will let the systemd unit continue in case of error. For example if you haven't tiny-dfr installed, the service should still continue to execute - with cosmetic errors in journal. Feel free to remove what you don't need.

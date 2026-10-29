@@ -1,4 +1,4 @@
-# Apple T2 Audio Driver
+# t2bce_audio
 
 This module contains the Apple T2 audio kernel driver.
 
